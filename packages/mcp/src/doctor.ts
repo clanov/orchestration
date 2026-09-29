@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import type { WorkerAdapter } from "@clanov/orchestration-core";
 import { SqliteStateStore } from "@clanov/orchestration-state";
 import {
   createWorkersFromEnv,
@@ -30,7 +31,7 @@ try {
 
 rows.push(["Environment", envFile ?? "no .env loaded"]);
 
-let workers = [];
+let workers: WorkerAdapter[] = [];
 try {
   workers = createWorkersFromEnv();
 } catch (error) {
