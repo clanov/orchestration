@@ -33,7 +33,13 @@ if (antigravityModel) {
     new AntigravityWorker({
       command: process.env.ORCHESTRATION_ANTIGRAVITY_COMMAND ?? "agy",
       model: antigravityModel,
-      effort: parseAgyEffort(process.env.ORCHESTRATION_ANTIGRAVITY_EFFORT),
+      ...(parseAgyEffort(process.env.ORCHESTRATION_ANTIGRAVITY_EFFORT)
+        ? {
+            effort: parseAgyEffort(
+              process.env.ORCHESTRATION_ANTIGRAVITY_EFFORT,
+            )!,
+          }
+        : {}),
       allowMutations:
         process.env.ORCHESTRATION_ANTIGRAVITY_ALLOW_MUTATIONS === "1",
       timeoutMs: parsePositiveInt(
