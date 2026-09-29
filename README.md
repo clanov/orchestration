@@ -1,122 +1,126 @@
 # orchestration
 
-A local-first coordination layer for coding agents.
+A local-first Lead + Sidekick harness for coding agents.
 
-Keep your strongest model in the lead. Let persistent native coding-agent sidekicks execute in parallel, fan out to their own subagents, ask the lead when judgment is needed, work in isolated git worktrees, and only bring verified changes back through an explicit guarded apply.
+Keep the strongest model in the Lead seat. Pair it with one persistent native coding-agent Sidekick that keeps its own context and worktree across handoffs. The Lead owns planning, ambiguity, judgment, and final review; the Sidekick explores, implements, tests, and responds to feedback.
 
-> Early alpha. The repository is being bootstrapped in private before its first public release.
+> Early alpha.
 
 ## Model
 
 ```text
-                         Lead
-                plan / judgment / review
-                    /              \
-         async delegate        async delegate
-              |                     |
-              v                     v
-        isolated worktree      isolated worktree
-          Sidekick A             Sidekick B
-           /     \                  |
-      subagent subagent          subagent(s)
-              \                     /
-               +---- ask lead ------+
-
-Sidekick result
-  -> harness verify
-  -> Lead review
-  -> prepare_apply (no mutation)
-  -> explicit Lead approval
-  -> apply_to_lead
+User
+  |
+  v
+Lead
+plan / judgment / review
+  |
+  | start_sidekick once
+  v
+Persistent Sidekick
+same native session + same isolated worktree
+  |
+  +-- handoff: explore
+  |
+  +-- handoff: implement + test
+  |
+  +-- handoff: review feedback / fix
+  |
+  v
+harness verification
+  |
+  v
+Lead review
+  |
+prepare_apply -> explicit approval -> apply_to_lead
 ```
 
-The project is inspired by Cognition's lead/sidekick Fusion pattern, but is independent and not affiliated with Cognition or Devin.
+The project is inspired by Cognition's Devin Fusion lead/sidekick pattern, but is independent and not affiliated with Cognition or Devin.
 
-Dynamic model switching during context compaction is deliberately **not implemented yet**.
+The default abstraction is deliberately **not** a worker pool. One Lead workspace gets one persistent Sidekick. Runtime-native subagents may help with read-only exploration or verification, but parallel writers are not encouraged by default.
+
+Dynamic model switching during context compaction is not implemented yet.
+
+## Why one persistent Sidekick
+
+The goal is to preserve two independent, useful contexts:
+
+- the Lead keeps user intent, planning, and review context
+- the Sidekick keeps implementation context across multiple handoffs
+- only briefs, results, questions, and feedback cross the boundary
+
+This avoids turning every subtask into a fresh agent session and keeps code-writing decisions from fragmenting across multiple workers.
+
+## Minimal configuration
+
+```env
+ORCHESTRATION_SIDEKICK=antigravity
+ORCHESTRATION_SIDEKICK_MODEL=gemini-3.8-flash-high
+ORCHESTRATION_SIDEKICK_ALLOW_MUTATIONS=1
+```
+
+Supported runtimes:
+
+| Runtime | `ORCHESTRATION_SIDEKICK` |
+| --- | --- |
+| OpenCode | `opencode` |
+| Antigravity / `agy` | `antigravity` |
+| Command Code | `command-code` |
+
+Native runtime authentication stays native. Provider API keys are not required by orchestration itself.
+
+Legacy runtime-specific environment variables are still accepted for compatibility. If multiple legacy runtimes are configured, orchestration selects the first reachable one before starting the MCP server and exposes only that Sidekick to the Lead.
 
 ## What is implemented
 
-- **Asynchronous Lead + Sidekick execution.**
-- **Persistent Sidekick sessions.**
-- **Sidekick -> Lead questions.**
-- **Sidekick -> native Subagents.**
-- **Per-task git worktree isolation.**
-- **Snapshot-at-delegation**, including tracked staged/unstaged changes and non-ignored untracked files.
-- **Sidekick-only diffs.** An immutable synthetic snapshot commit separates pre-existing Lead edits from changes authored after delegation.
-- **Harness-owned verification.**
-- **Two-phase guarded apply** back into the Lead workspace.
-- **Durable SQLite task state.** Sessions, worktrees, verification receipts, apply plans, and event history survive MCP restarts.
-- **Restart recovery.** Tasks active during a crash/restart become `interrupted` and can be continued with `resume_task`.
+- one persistent Sidekick per Lead workspace
+- automatic runtime selection before MCP startup
+- persistent native runtime sessions
+- Sidekick -> Lead judgment questions
+- repeated Lead -> Sidekick handoffs in the same native session
+- isolated git worktree per Sidekick session
+- snapshot-at-start, including tracked and non-ignored untracked Lead changes
+- Sidekick-only diffs
+- harness-owned verification
+- guarded two-phase apply back to the Lead workspace
+- durable SQLite task/session state
+- restart recovery
+
+## MCP workflow
+
+```text
+sidekick_status
+      |
+start_sidekick       <- once for the workspace
+      |
+Lead keeps planning/reviewing
+      |
+get_events / get_result
+      |
+      +-- waiting_for_lead -> reply_to_sidekick
+      |
+      +-- completed / verification_failed
+      |        |
+      |      get_diff
+      |        |
+      |      handoff       <- same Sidekick/session/worktree
+      |        |
+      |       ...
+      |
+prepare_apply
+      |
+apply_to_lead(confirm=true)
+      |
+cleanup
+```
+
+The MCP surface intentionally does not ask the Lead to choose a runtime on every handoff.
 
 ## Guarded apply
 
-Applying a Sidekick result is deliberately two-phase.
+`prepare_apply(taskId)` does not modify the Lead workspace. It computes only the Sidekick delta, fingerprints the current Lead state, runs `git apply --check`, and returns a one-use `planId`.
 
-### 1. Preflight
-
-```text
-prepare_apply(taskId)
-```
-
-This does **not** modify the Lead workspace. It:
-
-- requires a completed task with passing harness verification
-- computes only the Sidekick delta from the captured delegation snapshot
-- fingerprints the current Lead `HEAD` and working-tree contents
-- reports whether the Lead diverged since delegation
-- runs `git apply --check` against the Lead's current files
-- returns a one-use `planId`
-
-Example result:
-
-```text
-canApply: true
-headDiverged: true
-sourceChangedSinceDelegation: true
-sourceDirty: true
-patchHash: ...
-planId: ...
-approvalRequired: true
-```
-
-Divergence is informational. If the Sidekick touched different lines/files, a patch may still apply cleanly.
-
-### 2. Explicit approval
-
-```text
-apply_to_lead(
-  taskId,
-  planId,
-  confirm=true
-)
-```
-
-Before modifying anything, orchestration recomputes the Sidekick patch and Lead workspace fingerprint.
-
-If either changed after preflight, the plan is rejected as stale and the Lead must run `prepare_apply` again.
-
-Only then does it perform the patch apply. Changes are written into the Lead working tree but are **not automatically committed or staged**.
-
-## Snapshot semantics
-
-At delegation:
-
-```text
-Lead state at T0
-  ├─ HEAD
-  ├─ staged/unstaged tracked files
-  └─ non-ignored untracked files
-          |
-          v
-   synthetic snapshot commit
-          |
-          v
-   isolated Sidekick worktree
-```
-
-The synthetic snapshot commit is not checked out on the Lead branch. It exists only as an immutable comparison point.
-
-This fixes an important integration problem: if the Lead already had edits before delegation, those edits are not mistaken for Sidekick-authored changes when reviewing or applying the result.
+`apply_to_lead(taskId, planId, confirm=true)` recomputes both sides and rejects stale plans before applying. It never stages, commits, or pushes automatically.
 
 ## Verification
 
@@ -124,87 +128,53 @@ Every successful Sidekick turn triggers:
 
 ```text
 verificationCommands
-git diff --check <delegation snapshot>
+git diff --check <snapshotCommit>
 protectedPaths check
 ```
 
-A task reaches `completed` only after verification passes.
+Sidekick self-reports are advisory. The Lead should review the harness verification receipt and `get_diff`.
 
-A verification failure can be returned to the same Sidekick/session/worktree with `follow_up`.
+## Durable state
+
+State is stored by default at:
+
+```text
+~/.orchestration/state.sqlite
+```
+
+If the MCP process stops during an active turn, the task is restored as `interrupted`. `resume_task` reuses the preserved worktree and, when known, the same native runtime session.
 
 ## MCP tools
 
 | Tool | Purpose |
 | --- | --- |
-| `list_workers` | Runtime and subagent capabilities |
-| `list_tasks` | Durable task history and recovered tasks |
-| `delegate` | Start an isolated Sidekick asynchronously |
-| `get_events` | Monitor task and verification events |
-| `get_result` | Inspect task state |
-| `get_diff` | Review Sidekick-only delta |
-| `resume_task` | Continue a task interrupted by an MCP restart |
-| `reply_to_worker` | Answer a Sidekick judgment question |
-| `follow_up` | Continue the same Sidekick |
-| `prepare_apply` | Conflict/divergence preflight; no Lead mutation |
-| `apply_to_lead` | Explicitly approved guarded apply |
-| `cancel` | Cancel and preserve worktree |
-| `cleanup` | Remove inactive worktree |
-| `forget_task` | Delete cleaned-up durable task history |
-
-## Worktree lifecycle
-
-Worktrees default under:
-
-```text
-<tmp>/orchestration/worktrees/<repo>-<hash>/<task-id>
-```
-
-Override with:
-
-```bash
-ORCHESTRATION_WORKTREE_ROOT=/path/to/worktrees
-```
-
-## Supported runtimes
-
-| Runtime | Persistent session | Parallel subagents | Nesting |
-| --- | ---: | ---: | --- |
-| OpenCode | yes | yes | runtime/config-defined |
-| Antigravity / `agy` | yes | yes | runtime-defined |
-| Command Code | yes | yes | one level |
-
-## Provider credentials
-
-Detected but not persisted:
-
-- `GEMINI_API_KEY`
-- `OPENAI_API_KEY`
-- `OPENROUTER_API_KEY`
+| `sidekick_status` | Show the selected persistent Sidekick runtime |
+| `list_tasks` | Durable Sidekick session history |
+| `start_sidekick` | Start the Sidekick for a Lead workspace |
+| `handoff` | Send the next brief or feedback to the same Sidekick |
+| `get_events` | Read durable events |
+| `get_result` | Inspect state and verification |
+| `get_diff` | Review Sidekick-only changes |
+| `reply_to_sidekick` | Answer a Sidekick judgment question |
+| `resume_task` | Recover after MCP restart |
+| `prepare_apply` | Preflight a verified delta |
+| `apply_to_lead` | Explicit guarded apply |
+| `cancel` | Cancel and preserve the worktree |
+| `cleanup` | Remove an inactive worktree |
+| `forget_task` | Delete cleaned-up durable history |
 
 ## Development
 
-Requires Node.js 22 or newer.
+Requires Node.js 22.5+.
 
 ```bash
 npm install
 npm run build
-npm run typecheck
+npm run smoke
+npm run doctor
 ```
 
-## Status
-
-The current safety boundary is:
-
-```text
-Lead workspace != Sidekick workspace
-Sidekick claim != verification result
-review != apply
-preflight != approval
-```
-
-State is stored by default in `~/.orchestration/state.sqlite`. Run `npm run doctor` before connecting your Lead, and see [docs/QUICKSTART.md](docs/QUICKSTART.md) for a ready-to-run setup.
-
-Still planned: native streaming/subagent telemetry and automatic routing/escalation policy.
+See [docs/QUICKSTART.md](docs/QUICKSTART.md) for setup and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the state/integration model.
 
 ## License
 
