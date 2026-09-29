@@ -32,7 +32,8 @@ User
   v
 Lead
   |
-  | start_sidekick once
+  | first delegable handoff
+  | (lazy create)
   v
 Persistent Sidekick
 same native session + same isolated worktree
@@ -52,11 +53,11 @@ same native session + same isolated worktree
 
 A Lead should not map each bug, file, or CI failure to a fresh worker. The persistent Sidekick is the unit of collaboration.
 
-The MCP process selects one reachable runtime before exposing the Sidekick. Runtime choice is therefore configuration, not a per-handoff Lead decision.
+The MCP process selects one reachable runtime before exposing the Sidekick. Runtime choice is therefore configuration, not a per-handoff Lead decision. A native Sidekick session/worktree is created only on the first `handoff`, so short or serial judgment-heavy work can remain entirely with the Lead.
 
 ## Initial snapshot
 
-The source checkout may already contain uncommitted work. Starting the Sidekick captures a complete non-ignored repository snapshot without stashing or changing the Lead checkout.
+The source checkout may already contain uncommitted work. The first handoff captures a complete non-ignored repository snapshot without stashing or changing the Lead checkout.
 
 ```text
 Lead HEAD + tracked dirty + untracked
@@ -78,7 +79,7 @@ Every later `handoff` continues from this same worktree. The Sidekick delta is c
 
 The collaboration loop is intentionally small:
 
-1. Lead sends a brief with outcome, constraints, and success criteria.
+1. Lead decides there is actually delegable work and sends a brief with outcome, constraints, and success criteria. The first handoff lazily creates the persistent Sidekick.
 2. Sidekick explores/implements/tests in its own context and worktree.
 3. Sidekick returns a result or a material judgment question.
 4. Harness verifies the work independently.
@@ -194,8 +195,7 @@ active state + process restart
 
 - `sidekick_status`
 - `list_tasks`
-- `start_sidekick`
-- `handoff`
+- `handoff` (lazy create + subsequent feedback)
 - `get_events`
 - `get_result`
 - `get_diff`
