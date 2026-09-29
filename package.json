@@ -1,0 +1,17 @@
+{
+  "name": "@clanov/orchestration",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local-first coordination layer for coding agents",
+  "type": "module",
+  "workspaces": ["packages/*", "packages/adapters/*"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false",
+    "clean": "tsc -b --clean"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}
