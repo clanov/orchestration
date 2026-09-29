@@ -4,6 +4,7 @@ import {
   renderTaskBrief,
   type StartWorkerInput,
   type WorkerAdapter,
+  type WorkerCapabilities,
   type WorkerRunResult,
   type WorkerSession,
   type WorkerStartResult,
@@ -22,6 +23,16 @@ interface MessageEnvelope {
 
 export class OpenCodeWorker implements WorkerAdapter {
   readonly name = "opencode";
+
+  readonly capabilities: WorkerCapabilities = {
+    persistentSession: true,
+    parallelSubagents: true,
+    subagents: {
+      supported: true,
+      nesting: "runtime-defined",
+    },
+  };
+
   private readonly client;
   private readonly options: OpenCodeWorkerOptions & { baseUrl: string };
 

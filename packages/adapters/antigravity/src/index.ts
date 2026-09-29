@@ -4,6 +4,7 @@ import {
   renderTaskBrief,
   type StartWorkerInput,
   type WorkerAdapter,
+  type WorkerCapabilities,
   type WorkerRunResult,
   type WorkerSession,
   type WorkerStartResult,
@@ -27,6 +28,15 @@ interface AgyEnvelope {
 
 export class AntigravityWorker implements WorkerAdapter {
   readonly name = "antigravity";
+
+  readonly capabilities: WorkerCapabilities = {
+    persistentSession: true,
+    parallelSubagents: true,
+    subagents: {
+      supported: true,
+      nesting: "runtime-defined",
+    },
+  };
 
   private readonly options: Required<
     Pick<AntigravityWorkerOptions, "command" | "model" | "allowMutations" | "timeoutMs">
@@ -109,7 +119,7 @@ export class AntigravityWorker implements WorkerAdapter {
   }
 
   async cancel(_session: WorkerSession): Promise<void> {
-    // v0.1 is synchronous. Async job cancellation will own process handles later.
+    // v0.2 owns process handles in the task runner. The adapter remains session-oriented.
   }
 
   private async run(

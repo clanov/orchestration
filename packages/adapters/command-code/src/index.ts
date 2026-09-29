@@ -4,6 +4,7 @@ import {
   renderTaskBrief,
   type StartWorkerInput,
   type WorkerAdapter,
+  type WorkerCapabilities,
   type WorkerRunResult,
   type WorkerSession,
   type WorkerStartResult,
@@ -31,6 +32,15 @@ interface CommandCodeResultFrame {
 
 export class CommandCodeWorker implements WorkerAdapter {
   readonly name = "command-code";
+
+  readonly capabilities: WorkerCapabilities = {
+    persistentSession: true,
+    parallelSubagents: true,
+    subagents: {
+      supported: true,
+      nesting: "one-level",
+    },
+  };
 
   private readonly options: Required<
     Pick<
@@ -118,7 +128,7 @@ export class CommandCodeWorker implements WorkerAdapter {
   }
 
   async cancel(_session: WorkerSession): Promise<void> {
-    // v0.1 is synchronous. Async job cancellation will own process handles later.
+    // v0.2 owns process handles in the task runner. The adapter remains session-oriented.
   }
 
   private async run(

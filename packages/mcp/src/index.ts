@@ -1,14 +1,53 @@
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
-import type {
-  TaskBrief,
-  WorkerAdapter,
-  WorkerSession,
+import {
+  extractLeadQuestion,
+  renderLeadReply,
+  type TaskBrief,
+  type WorkerAdapter,
+  type WorkerRunResult,
+  type WorkerSession,
 } from "@clanov/orchestration-core";
 
-interface StoredSession {
+type TaskState =
+  | "queued"
+  | "running"
+  | "waiting_for_lead"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+type EventType =
+  | "task_queued"
+  | "worker_session_ready"
+  | "lead_question"
+  | "lead_reply"
+  | "follow_up"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+interface TaskEvent {
+  seq: number;
+  type: EventType;
+  at: string;
+  message?: string;
+  data?: unknown;
+}
+
+interface TaskRecord {
+  id: string;
   worker: WorkerAdapter;
-  session: WorkerSession;
+  state: TaskState;
+  createdAt: string;
+  updatedAt: string;
+  session?: WorkerSession;
+  result?: WorkerRunResult;
+  error?: string;
+  cancelRequested: boolean;
+  events: TaskEvent[];
+  nextSeq: number;
 }
 
 export interface OrchestrationServerOptions {
@@ -18,15 +57,31 @@ export interface OrchestrationServerOptions {
 export function createOrchestrationServer(
   options: OrchestrationServerOptions,
 ): McpServer {
-  const server = new McpServer({ name: "orchestration", version: "0.0.0" });
+  const server = new McpServer({ name: "orchestration", version: "0.1.0" });
   const workers = new Map(options.workers.map((worker) => [worker.name, worker]));
-  const sessions = new Map<string, StoredSession>();
+  const tasks = new Map<string, TaskRecord>();
+
+  server.registerTool(
+    "list_workers",
+    {
+      description:
+        "List configured sidekick runtimes and their persistent-session/subagent capabilities.",
+      inputSchema: z.object({}),
+    },
+    async () =>
+      toolJson(
+        [...workers.values()].map((worker) => ({
+          name: worker.name,
+          capabilities: worker.capabilities,
+        })),
+      ),
+  );
 
   server.registerTool(
     "delegate",
     {
       description:
-        "Delegate a bounded coding task to a native worker runtime and keep its session for follow-up turns.",
+        "Start a sidekick asynchronously. Returns a taskId immediately so the lead can keep working in parallel. Poll get_events/get_result later.",
       inputSchema: z.object({
         worker: z.string(),
         cwd: z.string(),
@@ -38,6 +93,7 @@ export function createOrchestrationServer(
         protectedPaths: z.array(z.string()).optional(),
         verificationCommands: z.array(z.string()).optional(),
         context: z.string().optional(),
+        subagentPolicy: z.enum(["auto", "prefer", "avoid"]).optional(),
       }),
     },
     async (input) => {
@@ -66,16 +122,94 @@ export function createOrchestrationServer(
           ? { verificationCommands: input.verificationCommands }
           : {}),
         ...(input.context ? { context: input.context } : {}),
+        ...(input.subagentPolicy
+          ? { subagentPolicy: input.subagentPolicy }
+          : {}),
       };
 
-      const started = await worker.start({
+      const record = createTask(worker);
+      tasks.set(record.id, record);
+      pushEvent(record, "task_queued", "Sidekick task queued.");
+
+      void startTask(record, {
         cwd: input.cwd,
         brief,
         ...(input.model ? { model: input.model } : {}),
       });
 
-      sessions.set(started.session.id, { worker, session: started.session });
-      return toolJson(started);
+      return toolJson(snapshot(record));
+    },
+  );
+
+  server.registerTool(
+    "get_result",
+    {
+      description:
+        "Inspect a delegated task without blocking. If status is waiting_for_lead, answer it with reply_to_worker.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+      }),
+    },
+    async ({ taskId }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+      return toolJson(snapshot(record));
+    },
+  );
+
+  server.registerTool(
+    "get_events",
+    {
+      description:
+        "Read task events emitted while the lead and sidekick run concurrently. lead_question events require a reply_to_worker call.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+        after: z.number().int().nonnegative().optional(),
+      }),
+    },
+    async ({ taskId, after }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+
+      const cursor = after ?? 0;
+      return toolJson({
+        taskId,
+        state: record.state,
+        events: record.events.filter((event) => event.seq > cursor),
+        nextCursor: record.events.at(-1)?.seq ?? cursor,
+      });
+    },
+  );
+
+  server.registerTool(
+    "reply_to_worker",
+    {
+      description:
+        "Answer a sidekick's judgment question and resume the same persistent worker session asynchronously.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+        answer: z.string().min(1),
+      }),
+    },
+    async ({ taskId, answer }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+      if (!record.session) {
+        return toolError("The sidekick session is not ready yet.");
+      }
+      if (record.state !== "waiting_for_lead") {
+        return toolError(
+          `Task "${taskId}" is ${record.state}, not waiting_for_lead.`,
+        );
+      }
+
+      pushEvent(record, "lead_reply", "Lead replied to sidekick.");
+      record.state = "running";
+      record.updatedAt = now();
+
+      void continueTask(record, renderLeadReply(answer));
+
+      return toolJson(snapshot(record));
     },
   );
 
@@ -83,47 +217,216 @@ export function createOrchestrationServer(
     "follow_up",
     {
       description:
-        "Send feedback to an existing delegated task while preserving native worker context.",
+        "Send non-question feedback to a completed sidekick and resume the same native session asynchronously.",
       inputSchema: z.object({
-        sessionId: z.string().uuid(),
+        taskId: z.string().uuid(),
         message: z.string().min(1),
       }),
     },
-    async ({ sessionId, message }) => {
-      const stored = sessions.get(sessionId);
-      if (!stored) return toolError(`Unknown session "${sessionId}".`);
-      return toolJson(await stored.worker.followUp(stored.session, message));
-    },
-  );
+    async ({ taskId, message }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+      if (!record.session) {
+        return toolError("The sidekick session is not ready yet.");
+      }
+      if (record.state === "running" || record.state === "queued") {
+        return toolError(
+          "The sidekick is still running. Use get_events/get_result while the lead continues other work.",
+        );
+      }
+      if (record.state === "waiting_for_lead") {
+        return toolError(
+          "The sidekick is waiting for a lead decision. Use reply_to_worker.",
+        );
+      }
+      if (record.state === "cancelled") {
+        return toolError("Cancelled tasks cannot be resumed.");
+      }
 
-  server.registerTool(
-    "get_result",
-    {
-      description: "Inspect the latest result from an existing worker session.",
-      inputSchema: z.object({ sessionId: z.string().uuid() }),
-    },
-    async ({ sessionId }) => {
-      const stored = sessions.get(sessionId);
-      if (!stored) return toolError(`Unknown session "${sessionId}".`);
-      return toolJson(await stored.worker.getResult(stored.session));
+      pushEvent(record, "follow_up", "Lead sent follow-up feedback.");
+      record.state = "running";
+      record.updatedAt = now();
+
+      void continueTask(record, message);
+
+      return toolJson(snapshot(record));
     },
   );
 
   server.registerTool(
     "cancel",
     {
-      description: "Abort an existing worker session.",
-      inputSchema: z.object({ sessionId: z.string().uuid() }),
+      description: "Cancel a delegated sidekick task.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+      }),
     },
-    async ({ sessionId }) => {
-      const stored = sessions.get(sessionId);
-      if (!stored) return toolError(`Unknown session "${sessionId}".`);
-      await stored.worker.cancel(stored.session);
-      return toolJson({ sessionId, status: "cancelled" });
+    async ({ taskId }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+
+      record.cancelRequested = true;
+      record.state = "cancelled";
+      record.updatedAt = now();
+      pushEvent(record, "cancelled", "Cancellation requested.");
+
+      if (record.session) {
+        await record.worker.cancel(record.session);
+      }
+
+      return toolJson(snapshot(record));
     },
   );
 
   return server;
+
+  async function startTask(
+    record: TaskRecord,
+    input: Parameters<WorkerAdapter["start"]>[0],
+  ): Promise<void> {
+    record.state = "running";
+    record.updatedAt = now();
+
+    try {
+      const started = await record.worker.start(input);
+
+      record.session = started.session;
+      pushEvent(record, "worker_session_ready", "Native sidekick session ready.", {
+        nativeSessionId: started.session.nativeSessionId,
+      });
+
+      if (record.cancelRequested) {
+        await record.worker.cancel(started.session);
+        return;
+      }
+
+      applyResult(record, started.result);
+    } catch (error) {
+      failTask(record, error);
+    }
+  }
+
+  async function continueTask(
+    record: TaskRecord,
+    message: string,
+  ): Promise<void> {
+    const session = record.session;
+    if (!session) {
+      failTask(record, new Error("Missing native sidekick session."));
+      return;
+    }
+
+    try {
+      const result = await record.worker.followUp(session, message);
+
+      if (record.cancelRequested) {
+        await record.worker.cancel(session);
+        return;
+      }
+
+      applyResult(record, result);
+    } catch (error) {
+      failTask(record, error);
+    }
+  }
+
+  function applyResult(
+    record: TaskRecord,
+    result: WorkerRunResult,
+  ): void {
+    const leadQuestion =
+      result.leadQuestion ?? extractLeadQuestion(result.summary);
+
+    if (leadQuestion) {
+      record.result = {
+        ...result,
+        status: "waiting_for_lead",
+        leadQuestion,
+      };
+      record.state = "waiting_for_lead";
+      record.updatedAt = now();
+      pushEvent(record, "lead_question", leadQuestion.question, leadQuestion);
+      return;
+    }
+
+    record.result = result;
+    record.state =
+      result.status === "failed"
+        ? "failed"
+        : result.status === "cancelled"
+          ? "cancelled"
+          : "completed";
+    record.updatedAt = now();
+
+    if (record.state === "failed") {
+      pushEvent(record, "failed", result.summary ?? "Sidekick failed.");
+    } else if (record.state === "cancelled") {
+      pushEvent(record, "cancelled", result.summary ?? "Sidekick cancelled.");
+    } else {
+      pushEvent(record, "completed", result.summary ?? "Sidekick completed.");
+    }
+  }
+
+  function failTask(record: TaskRecord, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    record.error = message;
+    record.state = "failed";
+    record.updatedAt = now();
+    pushEvent(record, "failed", message);
+  }
+}
+
+function createTask(worker: WorkerAdapter): TaskRecord {
+  const createdAt = now();
+  return {
+    id: randomUUID(),
+    worker,
+    state: "queued",
+    createdAt,
+    updatedAt: createdAt,
+    cancelRequested: false,
+    events: [],
+    nextSeq: 1,
+  };
+}
+
+function pushEvent(
+  record: TaskRecord,
+  type: EventType,
+  message?: string,
+  data?: unknown,
+): void {
+  record.events.push({
+    seq: record.nextSeq++,
+    type,
+    at: now(),
+    ...(message ? { message } : {}),
+    ...(data !== undefined ? { data } : {}),
+  });
+}
+
+function snapshot(record: TaskRecord) {
+  return {
+    taskId: record.id,
+    worker: record.worker.name,
+    state: record.state,
+    capabilities: record.worker.capabilities,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    ...(record.session
+      ? {
+          sessionId: record.session.id,
+          nativeSessionId: record.session.nativeSessionId,
+        }
+      : {}),
+    ...(record.result ? { result: record.result } : {}),
+    ...(record.error ? { error: record.error } : {}),
+    latestEventSeq: record.events.at(-1)?.seq ?? 0,
+  };
+}
+
+function now(): string {
+  return new Date().toISOString();
 }
 
 function toolJson(value: unknown) {

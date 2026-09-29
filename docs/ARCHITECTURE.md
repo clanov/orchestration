@@ -2,13 +2,87 @@
 
 ## Purpose
 
-orchestration is a local coordination layer between a lead coding agent and one or more native worker runtimes.
+orchestration is a local coordination layer between a frontier lead and one or more native coding-agent sidekicks.
 
-The project does **not** try to turn every model into the same chat-completions API. A worker is an agent runtime with its own tools, repository state, permissions, caches, and persistent conversation ID.
+The target interaction model is intentionally close to the useful part of Cognition's Fusion architecture:
+
+- the lead owns planning, ambiguity, architectural judgment, and final review
+- a sidekick owns bounded execution
+- both keep independent persistent contexts
+- they exchange briefs, results, feedback, and explicit judgment questions rather than mirroring whole transcripts
+- lead and sidekick run concurrently
+- a sidekick may use its native runtime's subagents
+
+Dynamic model switching at compaction boundaries is intentionally **out of scope for now**.
+
+## Hierarchy
+
+```text
+User
+  |
+  v
+Lead (frontier model)
+  | \
+  |  \ keeps planning / monitoring / reviewing
+  |   \
+  |    +--------------------------+
+  |                               |
+  | delegate (async)              |
+  v                               |
+Sidekick (persistent context)     |
+  |                               |
+  +--> native subagent(s)         |
+  |       exploration/tests/etc.  |
+  |                               |
+  +--> lead question -------------+
+        when judgment is needed
+```
+
+The lead can delegate several independent sidekick tasks. A sidekick can fan out to native subagents when its runtime supports that capability.
+
+## Lead-question protocol
+
+A sidekick must not silently guess through a material judgment call.
+
+When it needs the lead, it ends its current turn with:
+
+```text
+<orchestration_lead_query>
+{"question":"...","context":"..."}
+</orchestration_lead_query>
+```
+
+orchestration detects that envelope and moves the task to `waiting_for_lead`.
+
+The lead sees a `lead_question` event through `get_events` / `get_result`, calls `reply_to_worker`, and orchestration resumes the **same native sidekick session**.
+
+This is a cooperative checkpoint rather than a model-to-model API call: orchestration never needs the lead model's API key.
+
+## Concurrency model
+
+`delegate` is non-blocking from the lead's perspective:
+
+```text
+delegate
+  -> allocate orchestration task id
+  -> start native worker in background
+  -> return immediately
+
+lead
+  -> continues planning / another task / monitoring
+
+sidekick
+  -> works independently
+  -> completes, fails, or asks lead
+```
+
+The MCP surface exposes `get_events` so the lead can observe sidekick state without occupying the original delegation call.
+
+Until worktree isolation lands, concurrent **writes** to the same files are unsafe. The lead should keep doing judgment/review work and avoid editing the delegated scope while that sidekick is active.
 
 ## Runtime vs provider
 
-These are different concepts and stay separate in the codebase.
+These remain separate concepts.
 
 ```text
 Runtime
@@ -22,134 +96,65 @@ Provider credential
   OpenRouter API key
 ```
 
-A runtime owns the coding-agent loop and native session. A provider credential only gives a compatible runtime access to a model.
+A runtime owns the coding-agent loop, tools, subagents, and native session. A provider credential only gives a compatible runtime access to a model.
 
-orchestration does not store provider secrets. The provider registry only describes expected environment variables and can report whether a credential appears to be configured.
+orchestration does not store provider secrets.
 
-## Control flow
+## Sidekick -> subagent capabilities
 
-```text
-User
-  |
-  v
-Lead agent (for example Claude Code)
-  |
-  | MCP: delegate / follow_up / get_result / cancel
-  v
-orchestration
-  |
-  +--> worker adapter --> native runtime --> repository
-  |
-  +--> session registry
-  |
-  +--> verifier (planned)
-  |
-  +--> worktree manager (planned)
-```
+Capabilities are exposed to the lead through `list_workers`.
 
-The lead owns judgment: planning, ambiguity, architectural decisions, and final review.
+- **OpenCode:** native subagents supported; nesting is runtime/configuration-defined. OpenCode's Task permissions determine whether a spawned agent may itself invoke another agent.
+- **Antigravity:** parallel native subagents supported. The runtime controls the exact hierarchy.
+- **Command Code:** parallel native subagents supported, but delegation is one level deep; subagents do not receive the agent-spawning tools.
 
-Workers own bounded execution: repository exploration, implementation, tests, refactors, and other well-specified tasks.
+orchestration does not reimplement these agent systems. It preserves them.
 
 ## Core invariants
 
-1. **Native session continuity.** A follow-up must resume the same underlying worker session when the runtime supports it.
-2. **No transcript mirroring by default.** Workers receive a typed brief, not the lead's entire conversation history.
-3. **Worker self-reports are not proof.** Completion claims will eventually be paired with harness-owned verification receipts.
-4. **Critical safety is enforced mechanically.** Worktree isolation, protected paths, destructive-command policy, and merge gates must live in code rather than only prompts.
-5. **The lead remains authoritative.** A worker cannot decide that its own change is ready to merge.
-6. **Adapters preserve runtime semantics.** OpenCode uses OpenCode sessions, agy uses conversations, and Command Code uses its session IDs.
-7. **Provider secrets are not orchestration state.** Keys remain in environment variables or provider-native credential stores.
-
-## v0.1 state model
-
-The first implementation is synchronous on purpose.
-
-```text
-delegate
-  -> create native worker session
-  -> execute one turn
-  -> store orchestration session mapping
-  -> return result
-
-follow_up
-  -> resolve orchestration session
-  -> resume native worker session
-  -> execute one turn
-  -> return result
-```
-
-The MCP package keeps the orchestration-to-native session mapping in memory for now. Durable SQLite state and restart-safe jobs are planned after the contract is stable.
-
-## Worker contract
-
-Every adapter implements the same small interface:
-
-```ts
-interface WorkerAdapter {
-  readonly name: string
-  isAvailable(): Promise<boolean>
-  start(input: StartWorkerInput): Promise<WorkerStartResult>
-  followUp(session: WorkerSession, message: string): Promise<WorkerRunResult>
-  getResult(session: WorkerSession): Promise<WorkerRunResult>
-  cancel(session: WorkerSession): Promise<void>
-}
-```
-
-The common contract intentionally does not expose provider-specific token knobs. Runtime-specific configuration belongs in each adapter's constructor.
-
-## OpenCode adapter
-
-OpenCode exposes a headless HTTP server and an official TypeScript SDK. The adapter connects to an already-running server and uses native session creation, prompt messages, session messages, and abort.
-
-Reference: https://opencode.ai/docs/sdk/
-
-## Antigravity adapter
-
-The agy adapter uses official headless JSON output. New tasks capture `conversation_id`; follow-ups use `--conversation <id>`.
-
-Mutation permission is opt-in because headless automation can execute shell/file tools.
-
-Reference: https://antigravity.google/docs/cli/headless/
-
-## Command Code adapter
-
-The Command Code adapter uses `-p --output-format json`, parses the final NDJSON result frame, and preserves its `sessionId`. Follow-ups resume with `--resume <id>`.
-
-Mutation permission is opt-in. The full binary name `command-code` is the default so Windows does not collide with the built-in `cmd` shell.
-
-Reference: https://commandcode.ai/docs/headless
-
-## Provider registry
-
-The initial provider registry recognizes:
-
-- `GEMINI_API_KEY`
-- `OPENAI_API_KEY`
-- `OPENROUTER_API_KEY`
-
-It exposes metadata/probing only. Direct provider-backed coding workers are an explicit future layer because implementing them would require orchestration to own an agent tool loop.
+1. **Frontier lead remains authoritative.**
+2. **Native session continuity.**
+3. **No whole-transcript mirroring by default.**
+4. **Sidekicks may ask instead of guessing.**
+5. **Lead and sidekick are concurrent, but writes must be isolated before true concurrent editing is safe.**
+6. **Sidekick subagents use the native runtime's semantics and limits.**
+7. **Worker self-reports are not proof.** Harness-owned verification receipts are still planned.
+8. **Provider secrets are not orchestration state.**
+9. **No dynamic compaction-time model switching yet.**
 
 ## MCP surface
 
-The initial MCP surface stays deliberately small:
+- `list_workers` — runtime capabilities
+- `delegate` — asynchronously start a sidekick
+- `get_result` — inspect current task state
+- `get_events` — inspect incremental task events
+- `reply_to_worker` — answer a sidekick judgment question
+- `follow_up` — resume a completed persistent sidekick with feedback
+- `cancel` — cancel a task
 
-- `delegate`
-- `follow_up`
-- `get_result`
-- `cancel`
+## State model
 
-The MCP server uses stdio because the lead agent launches it as a local child process.
+```text
+queued
+  -> running
+       -> waiting_for_lead
+            -> running
+       -> completed
+       -> failed
+       -> cancelled
+```
+
+The current task registry remains in memory. SQLite persistence is still planned.
 
 ## Planned layers
 
 1. git worktree isolation
 2. verifier-owned test/lint/diff receipts
-3. SQLite session/job persistence
-4. async jobs and streaming progress
+3. SQLite task/session persistence
+4. native streaming/subagent telemetry
 5. runtime/provider doctor command
-6. rule-based routing
+6. rule-based routing and escalation
 7. execution telemetry and lead-rework metrics
-8. adaptive routing based on observed task outcomes
+8. adaptive routing based on observed outcomes
 
-Routing comes after instrumentation. The project should learn from completed work rather than inventing a complex router before it has data.
+Compaction-time model switching is deliberately deferred.
