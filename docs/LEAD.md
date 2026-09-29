@@ -17,7 +17,7 @@ Use these operating rules:
 - Avoid rereading every file the Sidekick already summarized unless the decision actually requires source-level inspection.
 - For an `interrupted` session after restart, use `resume_task`.
 - Run `prepare_apply` only after review. Call `apply_to_lead` only when the returned preflight still matches what you intend to integrate.
-- Do not automatically commit or push applied work.
+- Keep final git ownership in the Lead/human session. The Sidekick should leave work uncommitted and unpushed; review the diff before deciding whether to integrate/commit.
 
 Some work should remain with the Lead. Short judgment-heavy tasks and serial root-cause debugging may have little delegation leverage. The Sidekick is still the same persistent collaborator when execution work becomes delegable.
 
