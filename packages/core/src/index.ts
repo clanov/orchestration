@@ -86,7 +86,7 @@ const LEAD_QUERY_CLOSE = "</orchestration_lead_query>";
 
 export function renderTaskBrief(brief: TaskBrief): string {
   const sections: string[] = [
-    "# Delegated task",
+    "# Sidekick handoff",
     "",
     "## Objective",
     brief.objective,
@@ -105,10 +105,10 @@ export function renderTaskBrief(brief: TaskBrief): string {
   sections.push(
     "",
     "## Collaboration protocol",
-    "You are the sidekick. The lead owns planning, ambiguity, architecture, and final review.",
-    "Execute the bounded task independently in your native coding-agent runtime.",
-    "Use native subagents when useful and supported by your runtime. You remain responsible for their output.",
-    renderSubagentPolicy(brief.subagentPolicy),
+    "You are the persistent Sidekick paired with one Lead for this workspace.",
+    "The Lead owns planning, ambiguity, architecture, and final review. You own execution of the current handoff.",
+    "Build on your existing context and worktree across handoffs instead of treating each request as a fresh task.",
+    "Keep code-writing single-threaded by default. Native subagents may be used for read-only exploration or verification when clearly useful, but do not fan out independent writers unless the Lead explicitly asks.",
     "",
     "If you reach a judgment call that can materially change the implementation, do not guess. Stop the current turn and ask the lead by ending your response with exactly:",
     LEAD_QUERY_OPEN,
@@ -163,19 +163,6 @@ export function extractLeadQuestion(
     };
   } catch {
     return undefined;
-  }
-}
-
-function renderSubagentPolicy(
-  policy: TaskBrief["subagentPolicy"],
-): string {
-  switch (policy) {
-    case "prefer":
-      return "Prefer parallel native subagents for independent exploration, testing, or implementation units when safe.";
-    case "avoid":
-      return "Avoid spawning native subagents unless they are necessary to unblock the task.";
-    default:
-      return "Use your judgment about native subagents; parallelize independent work when it improves throughput without fragmenting a judgment-heavy decision.";
   }
 }
 
