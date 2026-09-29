@@ -81,7 +81,7 @@ The collaboration loop is intentionally small:
 
 1. Lead decides there is actually delegable work and sends a brief with outcome, constraints, and success criteria. The first handoff lazily creates the persistent Sidekick.
 2. Sidekick explores/implements/tests in its own context and worktree.
-3. Sidekick returns a result or a material judgment question.
+3. Sidekick leaves its changes uncommitted, returns the relevant result/diff, or asks a material judgment question.
 4. Harness verifies the work independently.
 5. Lead reviews the result/diff.
 6. Lead either sends another `handoff`, answers with `reply_to_sidekick`, or prepares integration.
@@ -217,9 +217,10 @@ active state + process restart
 6. Preflight does not mutate the Lead workspace.
 7. Apply requires explicit matching approval.
 8. Lead/Sidekick changes after preflight invalidate that approval.
-9. Apply never commits, stages, or pushes automatically.
-10. Runtime credentials stay outside durable orchestration state.
-11. Compaction-time model switching is deferred.
+9. Sidekick does not commit, push, merge, or rewrite history; final git integration stays with the Lead/human.
+10. Apply never commits, stages, or pushes automatically.
+11. Runtime credentials stay outside durable orchestration state.
+12. Compaction-time model switching is deferred.
 
 ## Planned layers
 
