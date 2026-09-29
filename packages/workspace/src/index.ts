@@ -25,6 +25,7 @@ export interface WorktreeLease {
 }
 
 export interface WorktreeSnapshot {
+  resultCommit: string;
   changedFiles: string[];
   untrackedFiles: string[];
   diffStat: string;
@@ -252,6 +253,7 @@ export class GitWorktreeManager {
         : patchRaw.slice(0, Math.max(0, maxPatchChars));
 
     return {
+      resultCommit: result.commit,
       changedFiles,
       untrackedFiles,
       diffStat,

@@ -63,18 +63,24 @@ export class WorktreeVerifier {
       );
     }
 
+    const snapshot = await this.workspace.inspect(lease, 0);
+
     checks.push(
       await runExecutableCheck(
         "git diff --check",
         "git",
-        ["diff", "--check", lease.snapshotCommit, "--"],
+        [
+          "diff",
+          "--check",
+          lease.snapshotCommit,
+          snapshot.resultCommit,
+          "--",
+        ],
         lease.worktreeRoot,
         this.commandTimeoutMs,
         this.outputTailChars,
       ),
     );
-
-    const snapshot = await this.workspace.inspect(lease, 0);
 
     const protectedPathViolations = findProtectedPathViolations(
       snapshot.changedFiles,
