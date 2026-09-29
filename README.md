@@ -45,6 +45,8 @@ Dynamic model switching during context compaction is deliberately **not implemen
 - **Sidekick-only diffs.** An immutable synthetic snapshot commit separates pre-existing Lead edits from changes authored after delegation.
 - **Harness-owned verification.**
 - **Two-phase guarded apply** back into the Lead workspace.
+- **Durable SQLite task state.** Sessions, worktrees, verification receipts, apply plans, and event history survive MCP restarts.
+- **Restart recovery.** Tasks active during a crash/restart become `interrupted` and can be continued with `resume_task`.
 
 ## Guarded apply
 
@@ -135,16 +137,19 @@ A verification failure can be returned to the same Sidekick/session/worktree wit
 | Tool | Purpose |
 | --- | --- |
 | `list_workers` | Runtime and subagent capabilities |
+| `list_tasks` | Durable task history and recovered tasks |
 | `delegate` | Start an isolated Sidekick asynchronously |
 | `get_events` | Monitor task and verification events |
 | `get_result` | Inspect task state |
 | `get_diff` | Review Sidekick-only delta |
+| `resume_task` | Continue a task interrupted by an MCP restart |
 | `reply_to_worker` | Answer a Sidekick judgment question |
 | `follow_up` | Continue the same Sidekick |
 | `prepare_apply` | Conflict/divergence preflight; no Lead mutation |
 | `apply_to_lead` | Explicitly approved guarded apply |
 | `cancel` | Cancel and preserve worktree |
 | `cleanup` | Remove inactive worktree |
+| `forget_task` | Delete cleaned-up durable task history |
 
 ## Worktree lifecycle
 
@@ -197,7 +202,9 @@ review != apply
 preflight != approval
 ```
 
-Still planned: durable SQLite state, native streaming/subagent telemetry, doctor command, and automatic routing/escalation policy.
+State is stored by default in `~/.orchestration/state.sqlite`. Run `npm run doctor` before connecting your Lead, and see [docs/QUICKSTART.md](docs/QUICKSTART.md) for a ready-to-run setup.
+
+Still planned: native streaming/subagent telemetry and automatic routing/escalation policy.
 
 ## License
 

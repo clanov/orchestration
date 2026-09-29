@@ -20,17 +20,19 @@ export function loadEnvironment(): string | undefined {
 export function createWorkersFromEnv(): WorkerAdapter[] {
   const workers: WorkerAdapter[] = [];
 
-  const openCodeProvider = process.env.ORCHESTRATION_OPENCODE_PROVIDER;
-  const openCodeModel = process.env.ORCHESTRATION_OPENCODE_MODEL;
+  const openCodeSpec = resolveOpenCodeModel(
+    process.env.ORCHESTRATION_OPENCODE_PROVIDER,
+    process.env.ORCHESTRATION_OPENCODE_MODEL,
+  );
 
-  if (openCodeProvider && openCodeModel) {
+  if (openCodeSpec) {
     workers.push(
       new OpenCodeWorker({
         baseUrl:
           process.env.ORCHESTRATION_OPENCODE_URL ??
           "http://127.0.0.1:4096",
-        providerID: openCodeProvider,
-        modelID: openCodeModel,
+        providerID: openCodeSpec.providerID,
+        modelID: openCodeSpec.modelID,
         ...(process.env.ORCHESTRATION_OPENCODE_AGENT
           ? { agent: process.env.ORCHESTRATION_OPENCODE_AGENT }
           : {}),
@@ -97,4 +99,26 @@ function parsePositiveInt(
 ): number {
   const parsed = Number.parseInt(value ?? "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+
+function resolveOpenCodeModel(
+  provider: string | undefined,
+  model: string | undefined,
+): { providerID: string; modelID: string } | undefined {
+  if (!model) return undefined;
+
+  if (provider) {
+    return { providerID: provider, modelID: model };
+  }
+
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash === model.length - 1) {
+    return undefined;
+  }
+
+  return {
+    providerID: model.slice(0, slash),
+    modelID: model.slice(slash + 1),
+  };
 }
