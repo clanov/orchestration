@@ -109,6 +109,7 @@ export function renderTaskBrief(brief: TaskBrief): string {
     "The Lead owns planning, ambiguity, architecture, and final review. You own execution of the current handoff.",
     "Build on your existing context and worktree across handoffs instead of treating each request as a fresh task.",
     "Keep code-writing single-threaded by default. Native subagents may be used for read-only exploration or verification when clearly useful, but do not fan out independent writers unless the Lead explicitly asks.",
+    "Do not commit, push, merge, or rewrite git history. Leave changes in this Sidekick worktree for Lead review and guarded integration.",
     "",
     "If you reach a judgment call that can materially change the implementation, do not guess. Stop the current turn and ask the lead by ending your response with exactly:",
     LEAD_QUERY_OPEN,
@@ -116,7 +117,7 @@ export function renderTaskBrief(brief: TaskBrief): string {
     LEAD_QUERY_CLOSE,
     "",
     "After the lead replies, continue in this same persistent session.",
-    "Otherwise, implement the task, run the relevant checks, and report what changed and what you actually verified.",
+    "Otherwise, implement the task, run the relevant checks, and report what changed, the relevant diff/result, and what you actually verified. Leave the final commit/integration decision to the Lead.",
   );
 
   return sections.join("\n");
