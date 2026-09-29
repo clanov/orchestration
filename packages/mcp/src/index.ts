@@ -4,11 +4,14 @@ import * as z from "zod/v4";
 import {
   extractLeadQuestion,
   renderLeadReply,
+  type LeadQuestion,
   type TaskBrief,
   type WorkerAdapter,
   type WorkerRunResult,
   type WorkerSession,
 } from "@clanov/orchestration-core";
+import type { StateStore } from "@clanov/orchestration-state";
+import { SqliteStateStore } from "@clanov/orchestration-state";
 import {
   GitWorktreeManager,
   type ApplyPreview,
@@ -28,13 +31,21 @@ type TaskState =
   | "verification_failed"
   | "completed"
   | "applied"
+  | "interrupted"
   | "failed"
   | "cancelled";
+
+type RecoverableActiveState =
+  | "queued"
+  | "preparing_workspace"
+  | "running"
+  | "verifying";
 
 type EventType =
   | "task_queued"
   | "workspace_preparing"
   | "workspace_ready"
+  | "worker_starting"
   | "worker_session_ready"
   | "lead_question"
   | "lead_reply"
@@ -46,6 +57,8 @@ type EventType =
   | "apply_rejected"
   | "applied"
   | "completed"
+  | "recovered_interrupted"
+  | "resume_started"
   | "failed"
   | "cancelled"
   | "workspace_cleaned";
@@ -66,10 +79,13 @@ interface ApplyPlan {
 
 interface TaskRecord {
   id: string;
-  worker: WorkerAdapter;
+  workerName: string;
+  worker?: WorkerAdapter;
+  model?: string;
   sourceCwd: string;
   brief: TaskBrief;
   state: TaskState;
+  interruptedFrom?: RecoverableActiveState;
   createdAt: string;
   updatedAt: string;
   workspace?: WorktreeLease;
@@ -84,20 +100,54 @@ interface TaskRecord {
   nextSeq: number;
 }
 
+interface PersistedWorkerRunResult {
+  sessionId: string;
+  status: WorkerRunResult["status"];
+  summary?: string;
+  leadQuestion?: LeadQuestion;
+}
+
+interface PersistedTaskRecord {
+  version: 1;
+  id: string;
+  workerName: string;
+  model?: string;
+  sourceCwd: string;
+  brief: TaskBrief;
+  state: TaskState;
+  interruptedFrom?: RecoverableActiveState;
+  createdAt: string;
+  updatedAt: string;
+  workspace?: WorktreeLease;
+  session?: WorkerSession;
+  result?: PersistedWorkerRunResult;
+  verification?: VerificationReport;
+  verificationHistory: VerificationReport[];
+  applyPlan?: ApplyPlan;
+  error?: string;
+  cancelRequested: boolean;
+  events: TaskEvent[];
+  nextSeq: number;
+}
+
 export interface OrchestrationServerOptions {
   workers: WorkerAdapter[];
   workspace?: GitWorktreeManager;
   verifier?: WorktreeVerifier;
+  stateStore?: StateStore;
 }
 
 export function createOrchestrationServer(
   options: OrchestrationServerOptions,
 ): McpServer {
-  const server = new McpServer({ name: "orchestration", version: "0.3.0" });
+  const server = new McpServer({ name: "orchestration", version: "0.4.0" });
   const workers = new Map(options.workers.map((worker) => [worker.name, worker]));
   const tasks = new Map<string, TaskRecord>();
   const workspace = options.workspace ?? new GitWorktreeManager();
   const verifier = options.verifier ?? new WorktreeVerifier(workspace);
+  const stateStore = options.stateStore ?? new SqliteStateStore();
+
+  restoreTasks();
 
   server.registerTool(
     "list_workers",
@@ -112,6 +162,21 @@ export function createOrchestrationServer(
           name: worker.name,
           capabilities: worker.capabilities,
         })),
+      ),
+  );
+
+  server.registerTool(
+    "list_tasks",
+    {
+      description:
+        "List durable orchestration tasks, including tasks recovered after an MCP restart.",
+      inputSchema: z.object({}),
+    },
+    async () =>
+      toolJson(
+        [...tasks.values()]
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+          .map((record) => snapshot(record)),
       ),
   );
 
@@ -165,11 +230,16 @@ export function createOrchestrationServer(
           : {}),
       };
 
-      const record = createTask(worker, input.cwd, brief);
+      const record = createTask(
+        worker,
+        input.cwd,
+        brief,
+        input.model,
+      );
       tasks.set(record.id, record);
-      pushEvent(record, "task_queued", "Sidekick task queued.");
+      emit(record, "task_queued", "Sidekick task queued.");
 
-      void startTask(record, input.model);
+      void startTask(record);
 
       return toolJson(snapshot(record));
     },
@@ -179,7 +249,7 @@ export function createOrchestrationServer(
     "get_result",
     {
       description:
-        "Inspect a delegated task without blocking, including worktree, verification, and apply-plan state.",
+        "Inspect a durable delegated task without blocking, including worktree, verification, recovery, and apply-plan state.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
       }),
@@ -195,7 +265,7 @@ export function createOrchestrationServer(
     "get_events",
     {
       description:
-        "Read incremental task events while the lead and sidekick run concurrently.",
+        "Read incremental durable task events while the lead and sidekick run concurrently.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
         after: z.number().int().nonnegative().optional(),
@@ -242,6 +312,74 @@ export function createOrchestrationServer(
   );
 
   server.registerTool(
+    "resume_task",
+    {
+      description:
+        "Resume a task that was interrupted by an orchestration process restart. Reuses the same worktree and native worker session when available.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+        message: z.string().min(1).optional(),
+      }),
+    },
+    async ({ taskId, message }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+      if (record.state !== "interrupted") {
+        return toolError(
+          `Task "${taskId}" is ${record.state}, not interrupted.`,
+        );
+      }
+
+      const worker = requireWorker(record);
+      if (!worker.ok) return toolError(worker.error);
+
+      if (!record.workspace) {
+        return toolError(
+          "The task was interrupted before a durable worktree was recorded. Delegate a fresh task from the current Lead workspace.",
+        );
+      }
+
+      delete record.error;
+      const interruptedFrom = record.interruptedFrom;
+      delete record.interruptedFrom;
+
+      if (interruptedFrom === "verifying" && record.result) {
+        record.state = "verifying";
+        record.updatedAt = now();
+        emit(
+          record,
+          "resume_started",
+          "Restart recovery resumed harness verification.",
+        );
+        void verifyTask(record);
+        return toolJson(snapshot(record));
+      }
+
+      record.state = "running";
+      record.updatedAt = now();
+      emit(
+        record,
+        "resume_started",
+        record.session
+          ? "Restart recovery resumed the existing native sidekick session."
+          : "Restart recovery is starting a new native sidekick session in the preserved worktree.",
+      );
+
+      if (record.session) {
+        void continueTask(
+          record,
+          message ??
+            "The orchestration process restarted. Inspect the current worktree, continue from the existing state without redoing completed work, then finish the delegated task and report what you verified.",
+        );
+      } else {
+        void restartWorkerInExistingWorkspace(record);
+      }
+
+      return toolJson(snapshot(record));
+    },
+  );
+
+  server.registerTool(
     "reply_to_worker",
     {
       description:
@@ -263,10 +401,13 @@ export function createOrchestrationServer(
         );
       }
 
+      const worker = requireWorker(record);
+      if (!worker.ok) return toolError(worker.error);
+
       invalidateApplyPlan(record);
-      pushEvent(record, "lead_reply", "Lead replied to sidekick.");
       record.state = "running";
       record.updatedAt = now();
+      emit(record, "lead_reply", "Lead replied to sidekick.");
 
       void continueTask(record, renderLeadReply(answer));
 
@@ -300,6 +441,11 @@ export function createOrchestrationServer(
           "The sidekick task is still active. Use get_events/get_result while the lead continues other work.",
         );
       }
+      if (record.state === "interrupted") {
+        return toolError(
+          "The task was interrupted by a process restart. Use resume_task first.",
+        );
+      }
       if (record.state === "waiting_for_lead") {
         return toolError(
           "The sidekick is waiting for a lead decision. Use reply_to_worker.",
@@ -314,10 +460,13 @@ export function createOrchestrationServer(
         );
       }
 
+      const worker = requireWorker(record);
+      if (!worker.ok) return toolError(worker.error);
+
       invalidateApplyPlan(record);
-      pushEvent(record, "follow_up", "Lead sent follow-up feedback.");
       record.state = "running";
       record.updatedAt = now();
+      emit(record, "follow_up", "Lead sent follow-up feedback.");
 
       void continueTask(record, message);
 
@@ -360,7 +509,7 @@ export function createOrchestrationServer(
         record.applyPlan = plan;
         record.updatedAt = now();
 
-        pushEvent(
+        emit(
           record,
           "apply_prepared",
           preview.canApply
@@ -380,7 +529,7 @@ export function createOrchestrationServer(
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        pushEvent(record, "apply_rejected", message);
+        emit(record, "apply_rejected", message);
         return toolError(message);
       }
     },
@@ -433,11 +582,11 @@ export function createOrchestrationServer(
           sourceTree: plan.preview.sourceTree,
         });
 
-        record.applyPlan = undefined;
+        delete record.applyPlan;
         record.state = "applied";
         record.updatedAt = now();
 
-        pushEvent(
+        emit(
           record,
           "applied",
           result.applied
@@ -452,9 +601,9 @@ export function createOrchestrationServer(
           ...result,
         });
       } catch (error) {
-        record.applyPlan = undefined;
+        delete record.applyPlan;
         const message = error instanceof Error ? error.message : String(error);
-        pushEvent(record, "apply_rejected", message);
+        emit(record, "apply_rejected", message);
         return toolError(message);
       }
     },
@@ -477,9 +626,9 @@ export function createOrchestrationServer(
       invalidateApplyPlan(record);
       record.state = "cancelled";
       record.updatedAt = now();
-      pushEvent(record, "cancelled", "Cancellation requested.");
+      emit(record, "cancelled", "Cancellation requested.");
 
-      if (record.session) {
+      if (record.session && record.worker) {
         await record.worker.cancel(record.session);
       }
 
@@ -491,7 +640,7 @@ export function createOrchestrationServer(
     "cleanup",
     {
       description:
-        "Remove an inactive task's isolated git worktree after the lead no longer needs its diff.",
+        "Remove an inactive task's isolated git worktree after the lead no longer needs its diff. Durable task history is retained.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
       }),
@@ -514,29 +663,61 @@ export function createOrchestrationServer(
 
       invalidateApplyPlan(record);
       await workspace.remove(record.workspace);
-      record.workspace = undefined;
+      delete record.workspace;
       record.updatedAt = now();
-      pushEvent(record, "workspace_cleaned", "Isolated worktree removed.");
+      emit(record, "workspace_cleaned", "Isolated worktree removed.");
 
       return toolJson({ taskId, cleaned: true });
     },
   );
 
+  server.registerTool(
+    "forget_task",
+    {
+      description:
+        "Delete durable history for an inactive task after its worktree has already been cleaned up.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+        confirm: z.literal(true),
+      }),
+    },
+    async ({ taskId }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+      if (record.workspace) {
+        return toolError(
+          "Clean up the task worktree before forgetting durable task history.",
+        );
+      }
+      if (
+        record.state === "queued" ||
+        record.state === "preparing_workspace" ||
+        record.state === "running" ||
+        record.state === "waiting_for_lead" ||
+        record.state === "verifying"
+      ) {
+        return toolError("Cannot forget an active task.");
+      }
+
+      stateStore.delete(taskId);
+      tasks.delete(taskId);
+
+      return toolJson({ taskId, forgotten: true });
+    },
+  );
+
   return server;
 
-  async function startTask(
-    record: TaskRecord,
-    model: string | undefined,
-  ): Promise<void> {
+  async function startTask(record: TaskRecord): Promise<void> {
     record.state = "preparing_workspace";
     record.updatedAt = now();
-    pushEvent(record, "workspace_preparing", "Preparing isolated git worktree.");
+    emit(record, "workspace_preparing", "Preparing isolated git worktree.");
 
     try {
       const lease = await workspace.prepare(record.id, record.sourceCwd);
       record.workspace = lease;
       record.updatedAt = now();
-      pushEvent(record, "workspace_ready", "Isolated git worktree ready.", {
+      emit(record, "workspace_ready", "Isolated git worktree ready.", {
         worktreeRoot: lease.worktreeRoot,
         baseCommit: lease.baseCommit,
         snapshotCommit: lease.snapshotCommit,
@@ -545,26 +726,74 @@ export function createOrchestrationServer(
 
       if (record.cancelRequested) {
         await workspace.remove(lease);
-        record.workspace = undefined;
+        delete record.workspace;
+        persist(record);
         return;
       }
 
       record.state = "running";
-      const started = await record.worker.start({
+      record.updatedAt = now();
+      emit(record, "worker_starting", "Starting native sidekick session.");
+
+      const worker = requireWorker(record);
+      if (!worker.ok) {
+        failTask(record, new Error(worker.error));
+        return;
+      }
+
+      const started = await worker.worker.start({
         cwd: lease.workerCwd,
         brief: record.brief,
-        ...(model ? { model } : {}),
+        ...(record.model ? { model: record.model } : {}),
       });
 
       record.session = started.session;
-      pushEvent(record, "worker_session_ready", "Native sidekick session ready.", {
+      record.updatedAt = now();
+      emit(record, "worker_session_ready", "Native sidekick session ready.", {
         nativeSessionId: started.session.nativeSessionId,
       });
 
       if (record.cancelRequested) {
-        await record.worker.cancel(started.session);
+        await worker.worker.cancel(started.session);
         return;
       }
+
+      await applyResult(record, started.result);
+    } catch (error) {
+      failTask(record, error);
+    }
+  }
+
+  async function restartWorkerInExistingWorkspace(
+    record: TaskRecord,
+  ): Promise<void> {
+    const lease = record.workspace;
+    if (!lease) {
+      failTask(record, new Error("Missing preserved Sidekick worktree."));
+      return;
+    }
+
+    const worker = requireWorker(record);
+    if (!worker.ok) {
+      failTask(record, new Error(worker.error));
+      return;
+    }
+
+    try {
+      const started = await worker.worker.start({
+        cwd: lease.workerCwd,
+        brief: record.brief,
+        ...(record.model ? { model: record.model } : {}),
+      });
+
+      record.session = started.session;
+      record.updatedAt = now();
+      emit(
+        record,
+        "worker_session_ready",
+        "Recovered task started a native sidekick session.",
+        { nativeSessionId: started.session.nativeSessionId },
+      );
 
       await applyResult(record, started.result);
     } catch (error) {
@@ -582,11 +811,17 @@ export function createOrchestrationServer(
       return;
     }
 
+    const worker = requireWorker(record);
+    if (!worker.ok) {
+      failTask(record, new Error(worker.error));
+      return;
+    }
+
     try {
-      const result = await record.worker.followUp(session, message);
+      const result = await worker.worker.followUp(session, message);
 
       if (record.cancelRequested) {
-        await record.worker.cancel(session);
+        await worker.worker.cancel(session);
         return;
       }
 
@@ -613,7 +848,7 @@ export function createOrchestrationServer(
       };
       record.state = "waiting_for_lead";
       record.updatedAt = now();
-      pushEvent(record, "lead_question", leadQuestion.question, leadQuestion);
+      emit(record, "lead_question", leadQuestion.question, leadQuestion);
       return;
     }
 
@@ -622,14 +857,14 @@ export function createOrchestrationServer(
     if (result.status === "failed") {
       record.state = "failed";
       record.updatedAt = now();
-      pushEvent(record, "failed", result.summary ?? "Sidekick failed.");
+      emit(record, "failed", result.summary ?? "Sidekick failed.");
       return;
     }
 
     if (result.status === "cancelled") {
       record.state = "cancelled";
       record.updatedAt = now();
-      pushEvent(record, "cancelled", result.summary ?? "Sidekick cancelled.");
+      emit(record, "cancelled", result.summary ?? "Sidekick cancelled.");
       return;
     }
 
@@ -645,7 +880,7 @@ export function createOrchestrationServer(
     invalidateApplyPlan(record);
     record.state = "verifying";
     record.updatedAt = now();
-    pushEvent(record, "verification_started", "Harness verification started.");
+    emit(record, "verification_started", "Harness verification started.");
 
     try {
       const report = await verifier.verify(record.workspace, record.brief);
@@ -655,11 +890,20 @@ export function createOrchestrationServer(
 
       if (report.status === "passed") {
         record.state = "completed";
-        pushEvent(record, "verification_passed", "Harness verification passed.", report);
-        pushEvent(record, "completed", record.result?.summary ?? "Sidekick completed.");
+        emit(
+          record,
+          "verification_passed",
+          "Harness verification passed.",
+          report,
+        );
+        emit(
+          record,
+          "completed",
+          record.result?.summary ?? "Sidekick completed.",
+        );
       } else {
         record.state = "verification_failed";
-        pushEvent(
+        emit(
           record,
           "verification_failed",
           "Harness verification failed. The lead can inspect the report and follow up in the same sidekick session.",
@@ -677,7 +921,91 @@ export function createOrchestrationServer(
     record.error = message;
     record.state = "failed";
     record.updatedAt = now();
-    pushEvent(record, "failed", message);
+    emit(record, "failed", message);
+  }
+
+  function restoreTasks(): void {
+    for (const row of stateStore.list()) {
+      let persisted: PersistedTaskRecord;
+      try {
+        persisted = JSON.parse(row.payload) as PersistedTaskRecord;
+      } catch {
+        continue;
+      }
+
+      if (persisted.version !== 1 || !persisted.id || !persisted.workerName) {
+        continue;
+      }
+
+      const worker = workers.get(persisted.workerName);
+      const record: TaskRecord = {
+        id: persisted.id,
+        workerName: persisted.workerName,
+        ...(worker ? { worker } : {}),
+        ...(persisted.model ? { model: persisted.model } : {}),
+        sourceCwd: persisted.sourceCwd,
+        brief: persisted.brief,
+        state: persisted.state,
+        ...(persisted.interruptedFrom
+          ? { interruptedFrom: persisted.interruptedFrom }
+          : {}),
+        createdAt: persisted.createdAt,
+        updatedAt: persisted.updatedAt,
+        ...(persisted.workspace ? { workspace: persisted.workspace } : {}),
+        ...(persisted.session ? { session: persisted.session } : {}),
+        ...(persisted.result ? { result: persisted.result } : {}),
+        ...(persisted.verification
+          ? { verification: persisted.verification }
+          : {}),
+        verificationHistory: persisted.verificationHistory ?? [],
+        ...(persisted.applyPlan ? { applyPlan: persisted.applyPlan } : {}),
+        ...(persisted.error ? { error: persisted.error } : {}),
+        cancelRequested: persisted.cancelRequested ?? false,
+        events: persisted.events ?? [],
+        nextSeq: persisted.nextSeq ?? 1,
+      };
+
+      tasks.set(record.id, record);
+
+      if (isActiveState(record.state)) {
+        const interruptedFrom = record.state;
+        record.state = "interrupted";
+        record.interruptedFrom = interruptedFrom;
+        record.cancelRequested = false;
+        delete record.applyPlan;
+        record.updatedAt = now();
+
+        emit(
+          record,
+          "recovered_interrupted",
+          "The MCP process stopped while this task was active. The worktree/session metadata was recovered; call resume_task to continue safely.",
+          { interruptedFrom },
+        );
+      }
+    }
+  }
+
+  function persist(record: TaskRecord): void {
+    stateStore.put(
+      record.id,
+      JSON.stringify(toPersisted(record)),
+    );
+  }
+
+  function emit(
+    record: TaskRecord,
+    type: EventType,
+    message?: string,
+    data?: unknown,
+  ): void {
+    record.events.push({
+      seq: record.nextSeq++,
+      type,
+      at: now(),
+      ...(message ? { message } : {}),
+      ...(data !== undefined ? { data } : {}),
+    });
+    persist(record);
   }
 }
 
@@ -685,11 +1013,14 @@ function createTask(
   worker: WorkerAdapter,
   sourceCwd: string,
   brief: TaskBrief,
+  model: string | undefined,
 ): TaskRecord {
   const createdAt = now();
   return {
     id: randomUUID(),
+    workerName: worker.name,
     worker,
+    ...(model ? { model } : {}),
     sourceCwd,
     brief,
     state: "queued",
@@ -702,31 +1033,86 @@ function createTask(
   };
 }
 
-function invalidateApplyPlan(record: TaskRecord): void {
-  record.applyPlan = undefined;
+function toPersisted(record: TaskRecord): PersistedTaskRecord {
+  const result = record.result
+    ? {
+        sessionId: record.result.sessionId,
+        status: record.result.status,
+        ...(record.result.summary
+          ? { summary: record.result.summary }
+          : {}),
+        ...(record.result.leadQuestion
+          ? { leadQuestion: record.result.leadQuestion }
+          : {}),
+      }
+    : undefined;
+
+  return {
+    version: 1,
+    id: record.id,
+    workerName: record.workerName,
+    ...(record.model ? { model: record.model } : {}),
+    sourceCwd: record.sourceCwd,
+    brief: record.brief,
+    state: record.state,
+    ...(record.interruptedFrom
+      ? { interruptedFrom: record.interruptedFrom }
+      : {}),
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    ...(record.workspace ? { workspace: record.workspace } : {}),
+    ...(record.session ? { session: record.session } : {}),
+    ...(result ? { result } : {}),
+    ...(record.verification ? { verification: record.verification } : {}),
+    verificationHistory: record.verificationHistory,
+    ...(record.applyPlan ? { applyPlan: record.applyPlan } : {}),
+    ...(record.error ? { error: record.error } : {}),
+    cancelRequested: record.cancelRequested,
+    events: record.events,
+    nextSeq: record.nextSeq,
+  };
 }
 
-function pushEvent(
+function requireWorker(
   record: TaskRecord,
-  type: EventType,
-  message?: string,
-  data?: unknown,
-): void {
-  record.events.push({
-    seq: record.nextSeq++,
-    type,
-    at: now(),
-    ...(message ? { message } : {}),
-    ...(data !== undefined ? { data } : {}),
-  });
+):
+  | { ok: true; worker: WorkerAdapter }
+  | { ok: false; error: string } {
+  if (record.worker) {
+    return { ok: true, worker: record.worker };
+  }
+
+  return {
+    ok: false,
+    error:
+      `Worker "${record.workerName}" is not configured in this MCP process. ` +
+      "Restore its environment/runtime configuration and restart orchestration.",
+  };
+}
+
+function isActiveState(state: TaskState): state is RecoverableActiveState {
+  return (
+    state === "queued" ||
+    state === "preparing_workspace" ||
+    state === "running" ||
+    state === "verifying"
+  );
+}
+
+function invalidateApplyPlan(record: TaskRecord): void {
+  delete record.applyPlan;
 }
 
 function snapshot(record: TaskRecord) {
   return {
     taskId: record.id,
-    worker: record.worker.name,
+    worker: record.workerName,
+    workerAvailable: Boolean(record.worker),
     state: record.state,
-    capabilities: record.worker.capabilities,
+    ...(record.interruptedFrom
+      ? { interruptedFrom: record.interruptedFrom }
+      : {}),
+    capabilities: record.worker?.capabilities ?? null,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
     ...(record.workspace
