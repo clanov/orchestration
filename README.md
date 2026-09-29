@@ -82,6 +82,7 @@ Legacy runtime-specific environment variables are still accepted for compatibili
 - snapshot-at-start, including tracked and non-ignored untracked Lead changes
 - Sidekick-only diffs
 - harness-owned verification
+- Sidekick leaves changes uncommitted/unpushed for Lead review
 - guarded two-phase apply back to the Lead workspace
 - durable SQLite task/session state
 - restart recovery
