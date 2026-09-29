@@ -15,7 +15,7 @@ User
 Lead
 plan / judgment / review
   |
-  | start_sidekick once
+  | first handoff lazily creates it
   v
 Persistent Sidekick
 same native session + same isolated worktree
@@ -91,7 +91,7 @@ Legacy runtime-specific environment variables are still accepted for compatibili
 ```text
 sidekick_status
       |
-start_sidekick       <- once for the workspace
+handoff              <- first call lazily creates the Sidekick
       |
 Lead keeps planning/reviewing
       |
@@ -114,7 +114,7 @@ apply_to_lead(confirm=true)
 cleanup
 ```
 
-The MCP surface intentionally does not ask the Lead to choose a runtime on every handoff.
+The MCP surface intentionally does not ask the Lead to choose a runtime or explicitly spawn a Sidekick. If delegation is not useful, no Sidekick is created. The first `handoff` creates it only when needed.
 
 ## Guarded apply
 
@@ -150,8 +150,7 @@ If the MCP process stops during an active turn, the task is restored as `interru
 | --- | --- |
 | `sidekick_status` | Show the selected persistent Sidekick runtime |
 | `list_tasks` | Durable Sidekick session history |
-| `start_sidekick` | Start the Sidekick for a Lead workspace |
-| `handoff` | Send the next brief or feedback to the same Sidekick |
+| `handoff` | Lazily start the Sidekick, then send later briefs/feedback to the same session |
 | `get_events` | Read durable events |
 | `get_result` | Inspect state and verification |
 | `get_diff` | Review Sidekick-only changes |
