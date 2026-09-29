@@ -49,7 +49,7 @@ type EventType =
   | "worker_session_ready"
   | "lead_question"
   | "lead_reply"
-  | "follow_up"
+  | "handoff"
   | "verification_started"
   | "verification_passed"
   | "verification_failed"
@@ -140,8 +140,12 @@ export interface OrchestrationServerOptions {
 export function createOrchestrationServer(
   options: OrchestrationServerOptions,
 ): McpServer {
-  const server = new McpServer({ name: "orchestration", version: "0.4.0" });
-  const workers = new Map(options.workers.map((worker) => [worker.name, worker]));
+  const server = new McpServer({ name: "orchestration", version: "0.5.0" });
+  const sidekick = options.workers[0];
+  if (!sidekick) throw new Error("orchestration requires one Sidekick runtime.");
+  // Fusion-style sessions expose one persistent Sidekick. Additional configured
+  // runtimes are fallback candidates selected before the MCP server starts.
+  const workers = new Map([[sidekick.name, sidekick]]);
   const tasks = new Map<string, TaskRecord>();
   const workspace = options.workspace ?? new GitWorktreeManager();
   const verifier = options.verifier ?? new WorktreeVerifier(workspace);
@@ -150,19 +154,17 @@ export function createOrchestrationServer(
   restoreTasks();
 
   server.registerTool(
-    "list_workers",
+    "sidekick_status",
     {
       description:
-        "List configured sidekick runtimes and their persistent-session/subagent capabilities.",
+        "Show the single persistent Sidekick runtime paired with this Lead. Runtime selection is owned by orchestration, not by each handoff.",
       inputSchema: z.object({}),
     },
     async () =>
-      toolJson(
-        [...workers.values()].map((worker) => ({
-          name: worker.name,
-          capabilities: worker.capabilities,
-        })),
-      ),
+      toolJson({
+        runtime: sidekick.name,
+        capabilities: sidekick.capabilities,
+      }),
   );
 
   server.registerTool(
@@ -181,14 +183,12 @@ export function createOrchestrationServer(
   );
 
   server.registerTool(
-    "delegate",
+    "start_sidekick",
     {
       description:
-        "Start a sidekick asynchronously in an isolated git worktree. Returns a taskId immediately so the lead can keep working in parallel.",
+        "Start the persistent Sidekick for a Lead workspace. Reuse it with handoff instead of spawning a new Sidekick per subtask.",
       inputSchema: z.object({
-        worker: z.string(),
         cwd: z.string(),
-        model: z.string().optional(),
         objective: z.string().min(1),
         constraints: z.array(z.string()).optional(),
         acceptanceCriteria: z.array(z.string()).optional(),
@@ -196,21 +196,20 @@ export function createOrchestrationServer(
         protectedPaths: z.array(z.string()).optional(),
         verificationCommands: z.array(z.string()).optional(),
         context: z.string().optional(),
-        subagentPolicy: z.enum(["auto", "prefer", "avoid"]).optional(),
       }),
     },
     async (input) => {
-      const worker = workers.get(input.worker);
-      if (!worker) {
+      const existing = [...tasks.values()].find(
+        (record) =>
+          record.sourceCwd === input.cwd &&
+          record.workspace &&
+          record.state !== "applied" &&
+          record.state !== "cancelled",
+      );
+      if (existing) {
         return toolError(
-          `Unknown worker "${input.worker}". Available workers: ${[
-            ...workers.keys(),
-          ].join(", ")}`,
+          `A persistent Sidekick already exists for this workspace as task ${existing.id} (${existing.state}). Use handoff/reply_to_sidekick/resume_task with that task instead of starting another writer.`,
         );
-      }
-
-      if (!(await worker.isAvailable())) {
-        return toolError(`Worker "${worker.name}" is not available.`);
       }
 
       const brief: TaskBrief = {
@@ -225,19 +224,11 @@ export function createOrchestrationServer(
           ? { verificationCommands: input.verificationCommands }
           : {}),
         ...(input.context ? { context: input.context } : {}),
-        ...(input.subagentPolicy
-          ? { subagentPolicy: input.subagentPolicy }
-          : {}),
       };
 
-      const record = createTask(
-        worker,
-        input.cwd,
-        brief,
-        input.model,
-      );
+      const record = createTask(sidekick, input.cwd, brief, undefined);
       tasks.set(record.id, record);
-      emit(record, "task_queued", "Sidekick task queued.");
+      emit(record, "task_queued", "Persistent Sidekick session queued.");
 
       void startTask(record);
 
@@ -335,7 +326,7 @@ export function createOrchestrationServer(
 
       if (!record.workspace) {
         return toolError(
-          "The task was interrupted before a durable worktree was recorded. Delegate a fresh task from the current Lead workspace.",
+          "The Sidekick was interrupted before a durable worktree was recorded. Start a fresh Sidekick from the current Lead workspace.",
         );
       }
 
@@ -380,10 +371,10 @@ export function createOrchestrationServer(
   );
 
   server.registerTool(
-    "reply_to_worker",
+    "reply_to_sidekick",
     {
       description:
-        "Answer a sidekick judgment question and resume the same persistent worker session asynchronously.",
+        "Answer a Sidekick judgment question and resume the same persistent native session asynchronously.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
         answer: z.string().min(1),
@@ -419,7 +410,7 @@ export function createOrchestrationServer(
     "follow_up",
     {
       description:
-        "Send feedback to a completed or verification-failed sidekick and resume the same native session asynchronously.",
+        "Send the next brief or review feedback to the same persistent Sidekick session and worktree.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
         message: z.string().min(1),
@@ -438,7 +429,7 @@ export function createOrchestrationServer(
         record.state === "verifying"
       ) {
         return toolError(
-          "The sidekick task is still active. Use get_events/get_result while the lead continues other work.",
+          "The Sidekick is still active. Use get_events/get_result while the Lead continues other work.",
         );
       }
       if (record.state === "interrupted") {
@@ -448,7 +439,7 @@ export function createOrchestrationServer(
       }
       if (record.state === "waiting_for_lead") {
         return toolError(
-          "The sidekick is waiting for a lead decision. Use reply_to_worker.",
+          "The sidekick is waiting for a lead decision. Use reply_to_sidekick.",
         );
       }
       if (record.state === "cancelled") {
@@ -456,7 +447,7 @@ export function createOrchestrationServer(
       }
       if (record.state === "applied") {
         return toolError(
-          "Applied tasks cannot be resumed. Delegate a new task from the updated Lead workspace.",
+          "Applied tasks cannot be resumed. Start a new Sidekick from the updated Lead workspace.",
         );
       }
 
@@ -466,7 +457,7 @@ export function createOrchestrationServer(
       invalidateApplyPlan(record);
       record.state = "running";
       record.updatedAt = now();
-      emit(record, "follow_up", "Lead sent follow-up feedback.");
+      emit(record, "follow_up", "Lead sent the next handoff to the persistent Sidekick.");
 
       void continueTask(record, message);
 
