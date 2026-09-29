@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { detectProviderCredentials } from "@clanov/orchestration-providers";
+import type { WorkerAdapter } from "@clanov/orchestration-core";
 import { SqliteStateStore } from "@clanov/orchestration-state";
-import { createWorkersFromEnv, loadEnvironment } from "./config.js";
+import {
+  createWorkersFromEnv,
+  loadEnvironment,
+  selectAvailableSidekick,
+} from "./config.js";
 
 const envFile = loadEnvironment();
-const workers = createWorkersFromEnv();
 const rows: Array<[string, string]> = [];
 
 rows.push(["Node", process.version]);
@@ -28,39 +31,42 @@ try {
 
 rows.push(["Environment", envFile ?? "no .env loaded"]);
 
-const workerAvailability: boolean[] = [];
-if (workers.length === 0) {
-  rows.push(["Workers", "FAIL: none configured"]);
-} else {
-  for (const worker of workers) {
-    let available = false;
-    try {
-      available = await worker.isAvailable();
-    } catch {
-      available = false;
-    }
-    workerAvailability.push(available);
-
-    rows.push([
-      `Worker ${worker.name}`,
-      available ? "OK" : "FAIL: configured but unavailable",
-    ]);
-  }
-}
-
-for (const provider of detectProviderCredentials()) {
+let workers: WorkerAdapter[] = [];
+try {
+  workers = createWorkersFromEnv();
+} catch (error) {
   rows.push([
-    `Provider ${provider.id}`,
-    provider.configured ? "credential detected" : "not configured",
+    "Configuration",
+    `FAIL: ${error instanceof Error ? error.message : String(error)}`,
   ]);
 }
+
+for (const worker of workers) {
+  let available = false;
+  try {
+    available = await worker.isAvailable();
+  } catch {
+    available = false;
+  }
+
+  rows.push([
+    `Runtime ${worker.name}`,
+    available ? "OK" : "configured but unavailable",
+  ]);
+}
+
+const sidekick = await selectAvailableSidekick(workers);
+rows.push([
+  "Selected Sidekick",
+  sidekick?.name ?? "FAIL: no reachable runtime",
+]);
 
 const width = Math.max(...rows.map(([name]) => name.length));
 for (const [name, value] of rows) {
   console.log(`${name.padEnd(width)}  ${value}`);
 }
 
-if (!git.ok || !workerAvailability.some(Boolean)) {
+if (!git.ok || !sidekick) {
   process.exitCode = 1;
 }
 

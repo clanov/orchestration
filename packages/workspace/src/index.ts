@@ -78,7 +78,7 @@ export class GitWorktreeManager {
   }
 
   async prepare(taskId: string, cwd: string): Promise<WorktreeLease> {
-    const sourceCwd = path.resolve(cwd);
+    const sourceCwd = resolveSourceCwd(cwd);
     const repoRoot = (
       await runGit(["rev-parse", "--show-toplevel"], sourceCwd)
     ).stdout.trim();
@@ -445,6 +445,22 @@ export class GitWorktreeManager {
       patch,
     };
   }
+}
+
+export function resolveSourceCwd(cwd: string): string {
+  const windowsPath = /^([a-zA-Z]):[\\\\/](.*)$/.exec(cwd.trim());
+
+  // MCP hosts on Windows commonly send a Windows cwd even when orchestration
+  // itself is running inside WSL. Translate the path before invoking git.
+  if (process.platform !== "win32" && windowsPath) {
+    const drive = windowsPath[1]!.toLowerCase();
+    const tail = windowsPath[2]!
+      .split(/[\\\\/]+/)
+      .filter(Boolean);
+    return path.posix.join("/mnt", drive, ...tail);
+  }
+
+  return path.resolve(cwd);
 }
 
 interface WorkingTreeCapture {
