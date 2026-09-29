@@ -1,8 +1,16 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, rm } from "node:fs/promises";
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  readlink,
+  rm,
+  symlink,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import path from "node:path";
+import * as path from "node:path";
 
 export interface WorktreeLease {
   taskId: string;
@@ -11,6 +19,7 @@ export interface WorktreeLease {
   worktreeRoot: string;
   workerCwd: string;
   baseCommit: string;
+  sourceWasDirty: boolean;
 }
 
 export interface WorktreeSnapshot {
@@ -23,19 +32,16 @@ export interface WorktreeSnapshot {
 
 export interface GitWorktreeManagerOptions {
   rootDir?: string;
-  requireCleanSource?: boolean;
 }
 
 export class GitWorktreeManager {
   private readonly rootDir: string;
-  private readonly requireCleanSource: boolean;
 
   constructor(options: GitWorktreeManagerOptions = {}) {
     this.rootDir =
       options.rootDir ??
       process.env.ORCHESTRATION_WORKTREE_ROOT ??
       path.join(tmpdir(), "orchestration", "worktrees");
-    this.requireCleanSource = options.requireCleanSource ?? true;
   }
 
   async prepare(taskId: string, cwd: string): Promise<WorktreeLease> {
@@ -48,28 +54,34 @@ export class GitWorktreeManager {
       throw new Error(`Could not resolve git repository for ${sourceCwd}.`);
     }
 
-    if (this.requireCleanSource) {
-      const status = (
-        await runGit(
-          ["status", "--porcelain=v1", "--untracked-files=all"],
-          repoRoot,
-        )
-      ).stdout.trim();
-
-      if (status) {
-        throw new Error(
-          [
-            "Source worktree has uncommitted changes.",
-            "orchestration creates sidekick worktrees from the current HEAD, so delegating now would silently omit those changes.",
-            "Commit or stash the source changes before delegating.",
-          ].join(" "),
-        );
-      }
-    }
-
     const baseCommit = (
       await runGit(["rev-parse", "HEAD"], repoRoot)
     ).stdout.trim();
+
+    const status = (
+      await runGit(
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        repoRoot,
+      )
+    ).stdout.trim();
+
+    const sourceWasDirty = Boolean(status);
+
+    // Capture the source worktree at delegation time. This includes tracked
+    // staged + unstaged changes and non-ignored untracked files, without
+    // mutating/stashing the Lead's checkout.
+    const trackedPatch = (
+      await runGit(["diff", "--binary", "HEAD", "--"], repoRoot)
+    ).stdout;
+
+    const untrackedFiles = splitLines(
+      (
+        await runGit(
+          ["ls-files", "--others", "--exclude-standard"],
+          repoRoot,
+        )
+      ).stdout,
+    );
 
     const repoKey = createHash("sha256")
       .update(repoRoot)
@@ -85,10 +97,29 @@ export class GitWorktreeManager {
 
     await mkdir(path.dirname(worktreeRoot), { recursive: true });
 
-    await runGit(
-      ["worktree", "add", "--detach", worktreeRoot, baseCommit],
-      repoRoot,
-    );
+    try {
+      await runGit(
+        ["worktree", "add", "--detach", worktreeRoot, baseCommit],
+        repoRoot,
+      );
+
+      if (trackedPatch.trim()) {
+        await runGit(
+          ["apply", "--whitespace=nowarn", "-"],
+          worktreeRoot,
+          trackedPatch,
+        );
+      }
+
+      await copyUntrackedFiles(repoRoot, worktreeRoot, untrackedFiles);
+    } catch (error) {
+      await runGit(
+        ["worktree", "remove", "--force", worktreeRoot],
+        repoRoot,
+      ).catch(() => undefined);
+      await rm(worktreeRoot, { recursive: true, force: true });
+      throw error;
+    }
 
     const relativeCwd = path.relative(repoRoot, sourceCwd);
     const workerCwd = relativeCwd
@@ -102,6 +133,7 @@ export class GitWorktreeManager {
       worktreeRoot,
       workerCwd,
       baseCommit,
+      sourceWasDirty,
     };
   }
 
@@ -172,6 +204,42 @@ export class GitWorktreeManager {
   }
 }
 
+async function copyUntrackedFiles(
+  repoRoot: string,
+  worktreeRoot: string,
+  files: string[],
+): Promise<void> {
+  const worktreePrefix = path.resolve(worktreeRoot) + path.sep;
+
+  for (const relativePath of files) {
+    const source = path.resolve(repoRoot, relativePath);
+    const destination = path.resolve(worktreeRoot, relativePath);
+
+    if (
+      destination !== path.resolve(worktreeRoot) &&
+      !destination.startsWith(worktreePrefix)
+    ) {
+      throw new Error(
+        `Refusing to copy untracked path outside worktree: ${relativePath}`,
+      );
+    }
+
+    const stat = await lstat(source);
+    await mkdir(path.dirname(destination), { recursive: true });
+
+    if (stat.isSymbolicLink()) {
+      const target = await readlink(source);
+      await symlink(target, destination);
+      continue;
+    }
+
+    if (stat.isFile()) {
+      await copyFile(source, destination);
+      await chmod(destination, stat.mode);
+    }
+  }
+}
+
 interface ProcessResult {
   exitCode: number;
   stdout: string;
@@ -181,8 +249,9 @@ interface ProcessResult {
 async function runGit(
   args: string[],
   cwd: string,
+  input?: string,
 ): Promise<ProcessResult> {
-  const result = await runProcess("git", args, cwd);
+  const result = await runProcess("git", args, cwd, input);
 
   if (result.exitCode !== 0) {
     throw new Error(
@@ -202,12 +271,13 @@ function runProcess(
   command: string,
   args: string[],
   cwd: string,
+  input?: string,
 ): Promise<ProcessResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd,
       env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     let stdout = "";
@@ -244,6 +314,8 @@ function runProcess(
         stderr,
       });
     });
+
+    child.stdin.end(input);
   });
 }
 

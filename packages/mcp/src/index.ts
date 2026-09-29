@@ -383,6 +383,7 @@ export function createOrchestrationServer(
       pushEvent(record, "workspace_ready", "Isolated git worktree ready.", {
         worktreeRoot: lease.worktreeRoot,
         baseCommit: lease.baseCommit,
+        sourceWasDirty: lease.sourceWasDirty,
       });
 
       if (record.cancelRequested) {
@@ -570,6 +571,7 @@ function snapshot(record: TaskRecord) {
             worktreeRoot: record.workspace.worktreeRoot,
             workerCwd: record.workspace.workerCwd,
             baseCommit: record.workspace.baseCommit,
+            sourceWasDirty: record.workspace.sourceWasDirty,
           },
         }
       : {}),

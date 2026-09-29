@@ -33,28 +33,34 @@ Dynamic model switching during context compaction is deliberately **not implemen
 - **Persistent sidekick sessions.** Lead replies and follow-ups resume the same native session.
 - **Sidekick -> Lead questions.** Material judgment calls can enter `waiting_for_lead`.
 - **Sidekick -> native Subagents.** Runtime-native agent hierarchies remain available.
-- **Per-task git worktree isolation.** Every delegated task starts from the source repository's current `HEAD` in a detached worktree.
-- **Harness-owned verification.** `git diff --check`, protected-path checks, and explicit verification commands run outside the sidekick's self-report.
+- **Per-task git worktree isolation.** Every delegated task gets its own detached worktree.
+- **Snapshot-at-delegation.** Tracked staged/unstaged changes plus non-ignored untracked files are copied into the Sidekick worktree without stashing or mutating the Lead checkout.
+- **Harness-owned verification.** Explicit project checks, `git diff --check`, and protected-path checks run outside the sidekick's self-report.
 - **Lead diff review.** `get_diff` exposes changed files, untracked files, diff stat, and a bounded patch.
 - **Verification repair loop.** A failed verifier result can be sent back with `follow_up` while preserving the same sidekick session and worktree.
 
-## Important source-worktree rule
+## Concurrent snapshot semantics
 
-Delegation currently requires the source git worktree to be clean.
-
-This is deliberate: an isolated sidekick worktree is created from the current commit. Starting from a dirty source tree would silently omit uncommitted Lead changes.
+Delegation captures the Lead's repository state **at that moment**:
 
 ```text
-dirty source
-  -> delegate rejected
+Lead worktree at T0
+  ├─ HEAD
+  ├─ tracked staged/unstaged changes
+  └─ non-ignored untracked files
+          |
+          | snapshot
+          v
+Sidekick isolated worktree
 
-clean source
-  -> capture HEAD
-  -> create detached sidekick worktree
-  -> Lead and Sidekick can now work independently
+T1:
+Lead keeps editing original checkout
+Sidekick keeps editing isolated snapshot
 ```
 
-Once the task starts, the Lead may continue changing the original worktree. The sidekick remains pinned to its isolated snapshot.
+This allows a Lead to keep working and to launch additional Sidekicks even when its own checkout has become dirty.
+
+Ignored files such as dependency/build caches are not copied. A Sidekick may need the runtime/project setup step appropriate for a fresh worktree.
 
 ## MCP tools
 
@@ -77,10 +83,12 @@ The verifier does not trust a worker saying "tests pass".
 Every completed worker turn triggers:
 
 ```text
+each verificationCommands entry supplied in the brief
 git diff --check <base>
-protectedPaths check
-+ each verificationCommands entry supplied in the brief
+protectedPaths check against the final worktree
 ```
+
+Project checks run first because tests/formatters can themselves update files. The final diff and protected-path inspection happen afterwards.
 
 A task only enters `completed` when these checks pass.
 
@@ -157,7 +165,7 @@ Lead workspace != Sidekick workspace
 Sidekick claim != verification result
 ```
 
-Still planned: durable SQLite task state, native streaming/subagent telemetry, merge/apply workflow, and routing/escalation policy.
+Still planned: durable SQLite task state, native streaming/subagent telemetry, guarded merge/apply, and routing/escalation policy.
 
 ## License
 

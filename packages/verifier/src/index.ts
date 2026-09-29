@@ -50,8 +50,20 @@ export class WorktreeVerifier {
     brief: TaskBrief,
   ): Promise<VerificationReport> {
     const startedAt = new Date().toISOString();
-    const snapshot = await this.workspace.inspect(lease, 0);
     const checks: VerificationReceipt[] = [];
+
+    // Explicit project checks may themselves generate or update files, so they
+    // run before the final diff snapshot/protected-path inspection.
+    for (const command of brief.verificationCommands ?? []) {
+      checks.push(
+        await runShellCheck(
+          command,
+          lease.workerCwd,
+          this.commandTimeoutMs,
+          this.outputTailChars,
+        ),
+      );
+    }
 
     checks.push(
       await runExecutableCheck(
@@ -64,16 +76,7 @@ export class WorktreeVerifier {
       ),
     );
 
-    for (const command of brief.verificationCommands ?? []) {
-      checks.push(
-        await runShellCheck(
-          command,
-          lease.workerCwd,
-          this.commandTimeoutMs,
-          this.outputTailChars,
-        ),
-      );
-    }
+    const snapshot = await this.workspace.inspect(lease, 0);
 
     const protectedPathViolations = findProtectedPathViolations(
       snapshot.changedFiles,
