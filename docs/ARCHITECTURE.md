@@ -134,6 +134,20 @@ If guards still match, orchestration runs `git apply` against the Lead checkout.
 
 It intentionally does **not** stage or commit the result. The Lead/human keeps ownership of the final git history.
 
+## Durable state and restart recovery
+
+Task state is persisted in SQLite after every state/event transition. The default database is:
+
+```text
+~/.orchestration/state.sqlite
+```
+
+Persisted state includes the worker name/model, task brief, native session id, worktree lease, verification history, event history, and guarded-apply plan. Worker secrets and API keys are never written into the database.
+
+On process startup, completed/waiting/failed/applied tasks are restored as-is. A task that was active when the process stopped is restored as `interrupted` with its prior active state recorded in `interruptedFrom`.
+
+`resume_task` then uses the preserved worktree. If a native session id was already known, it continues that same session. If the process died before a session id was recorded but the worktree exists, recovery can start a new native session in that preserved worktree. If no durable worktree was recorded, recovery refuses to silently take a new snapshot and the Lead must delegate a fresh task.
+
 ## State model
 
 ```text
@@ -150,6 +164,11 @@ queued
                  -> running
        -> failed
        -> cancelled
+
+active state + process restart
+  -> interrupted
+       -> resume_task
+            -> running / verifying
 ```
 
 `prepare_apply` itself leaves the state at `completed`; it only creates a one-use approval plan.
@@ -165,16 +184,19 @@ All child agents operate under the Sidekick runtime's isolated working directory
 ## MCP surface
 
 - `list_workers`
+- `list_tasks`
 - `delegate`
 - `get_events`
 - `get_result`
 - `get_diff`
+- `resume_task`
 - `reply_to_worker`
 - `follow_up`
 - `prepare_apply`
 - `apply_to_lead`
 - `cancel`
 - `cleanup`
+- `forget_task`
 
 ## Safety invariants
 
@@ -189,11 +211,13 @@ All child agents operate under the Sidekick runtime's isolated working directory
 9. Provider credentials remain outside orchestration state.
 10. Compaction-time model switching is deferred.
 
+## Runtime readiness
+
+Node 22.5+ is required for the built-in `node:sqlite` state store. `npm run doctor` checks Node/Git, the SQLite state database, configured native runtimes, and provider credential presence. CI builds the full TypeScript project and runs a smoke test that exercises dirty-source snapshotting, Sidekick-only diffs, guarded apply, and SQLite persistence.
+
 ## Planned layers
 
-1. durable SQLite task/session/worktree/apply-plan registry
-2. native streaming and subagent telemetry
-3. doctor command
-4. rule-based routing and automatic escalation
-5. execution telemetry and Lead-rework metrics
-6. adaptive routing based on observed outcomes
+1. native streaming and subagent telemetry
+2. rule-based routing and automatic escalation
+3. execution telemetry and Lead-rework metrics
+4. adaptive routing based on observed outcomes
