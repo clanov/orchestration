@@ -50,8 +50,14 @@ export class OpenCodeWorker implements WorkerAdapter {
 
   async isAvailable(): Promise<boolean> {
     try {
-      await this.client.global.health();
-      return true;
+      const response = await fetch(
+        new URL("/global/health", this.options.baseUrl),
+        {
+          method: "GET",
+          signal: AbortSignal.timeout(5_000),
+        },
+      );
+      return response.ok;
     } catch {
       return false;
     }
@@ -110,10 +116,12 @@ export class OpenCodeWorker implements WorkerAdapter {
 
     const last = messages.at(-1);
 
+    const summary = extractText(last);
+
     return {
       sessionId: session.id,
       status: "completed",
-      summary: extractText(last),
+      ...(summary ? { summary } : {}),
       raw: last,
     };
   }
@@ -148,9 +156,11 @@ export class OpenCodeWorker implements WorkerAdapter {
         },
       });
 
+      const summary = extractText(response);
+
       return {
         status: "completed",
-        summary: extractText(response),
+        ...(summary ? { summary } : {}),
         raw: response,
       };
     } catch (error) {

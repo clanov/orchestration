@@ -200,10 +200,14 @@ export class CommandCodeWorker implements WorkerAdapter {
     frame: CommandCodeResultFrame,
   ): WorkerRunResult {
     const success = frame.subtype === "success";
+    const summary = success
+      ? frame.finalText
+      : frame.error ?? frame.finalText;
+
     return {
       sessionId: orchestrationSessionId,
       status: success ? "completed" : "failed",
-      summary: success ? frame.finalText : frame.error ?? frame.finalText,
+      ...(summary ? { summary } : {}),
       raw: frame,
     };
   }

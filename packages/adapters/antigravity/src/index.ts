@@ -184,10 +184,14 @@ export class AntigravityWorker implements WorkerAdapter {
     envelope: AgyEnvelope,
   ): WorkerRunResult {
     const success = envelope.status === "SUCCESS";
+    const summary = success
+      ? envelope.response
+      : envelope.error ?? envelope.response;
+
     return {
       sessionId,
       status: success ? "completed" : "failed",
-      summary: success ? envelope.response : envelope.error ?? envelope.response,
+      ...(summary ? { summary } : {}),
       raw: envelope,
     };
   }
