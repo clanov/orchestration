@@ -8,6 +8,7 @@
   "references": [
     { "path": "../core" },
     { "path": "../providers" },
+    { "path": "../state" },
     { "path": "../workspace" },
     { "path": "../verifier" },
     { "path": "../adapters/opencode" },

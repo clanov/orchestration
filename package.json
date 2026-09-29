@@ -5,11 +5,13 @@
   "description": "Local-first coordination layer for coding agents",
   "type": "module",
   "workspaces": ["packages/*", "packages/adapters/*"],
-  "engines": { "node": ">=22" },
+  "engines": { "node": ">=22.5.0" },
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --pretty false",
-    "clean": "tsc -b --clean"
+    "clean": "tsc -b --clean",
+    "mcp": "node packages/mcp/dist/cli.js",
+    "doctor": "node packages/mcp/dist/doctor.js"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

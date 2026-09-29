@@ -10,7 +10,8 @@
     }
   },
   "bin": {
-    "orchestration-mcp": "./dist/cli.js"
+    "orchestration-mcp": "./dist/cli.js",
+    "orchestration-doctor": "./dist/doctor.js"
   },
   "files": ["dist"],
   "scripts": {
@@ -23,6 +24,7 @@
     "@clanov/orchestration-adapter-opencode": "0.0.0",
     "@clanov/orchestration-core": "0.0.0",
     "@clanov/orchestration-providers": "0.0.0",
+    "@clanov/orchestration-state": "0.0.0",
     "@clanov/orchestration-verifier": "0.0.0",
     "@clanov/orchestration-workspace": "0.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
