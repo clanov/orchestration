@@ -5,8 +5,8 @@ When orchestration is available, the Lead remains the session authority and work
 Use these operating rules:
 
 - Own the plan, ambiguous requirements, architecture, security-sensitive judgment, and final review.
-- Start one Sidekick early for the workspace instead of spawning a fresh worker for every subtask.
-- Reuse the same Sidekick with `handoff`; let its native session and worktree accumulate useful implementation context.
+- Do not create a Sidekick just because orchestration is available. Keep short, judgment-heavy, or serial root-cause work with the Lead when delegation has little leverage.
+- When there is delegable execution work, use `handoff`; the first call lazily creates the Sidekick and later calls reuse the same native session/worktree.
 - Give outcome/constraint-oriented briefs. Avoid dictating code when the Sidekick can work out the implementation.
 - Keep writes single-threaded by default. Do not create parallel writing Sidekicks just because a task has several files or failures.
 - Continue useful planning and review while a Sidekick turn runs.
