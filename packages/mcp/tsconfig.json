@@ -7,6 +7,9 @@
   "include": ["src/**/*.ts"],
   "references": [
     { "path": "../core" },
-    { "path": "../adapters/opencode" }
+    { "path": "../providers" },
+    { "path": "../adapters/opencode" },
+    { "path": "../adapters/antigravity" },
+    { "path": "../adapters/command-code" }
   ]
 }

@@ -1,14 +1,19 @@
 # Antigravity adapter
 
-Planned for the next vertical slice.
+Uses agy's official headless JSON interface rather than scraping the TUI.
 
-The integration target is agy's official headless interface rather than TUI scraping:
+New task:
 
 ```bash
-agy -p "..." --output-format stream-json
-agy -p "follow up" --conversation <conversation-id>
+agy -p "..." --output-format json --model <model>
 ```
 
-The adapter should preserve `conversation_id`, stream machine-readable events, and expose the same `WorkerAdapter` contract as OpenCode.
+Follow-up:
+
+```bash
+agy -p "..." --output-format json --conversation <conversation-id>
+```
+
+File/shell mutation is opt-in through `allowMutations` because it maps to agy's `--dangerously-skip-permissions`.
 
 Reference: https://antigravity.google/docs/cli/headless/

@@ -18,8 +18,11 @@
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
+    "@clanov/orchestration-adapter-antigravity": "0.0.0",
+    "@clanov/orchestration-adapter-command-code": "0.0.0",
     "@clanov/orchestration-adapter-opencode": "0.0.0",
     "@clanov/orchestration-core": "0.0.0",
+    "@clanov/orchestration-providers": "0.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "zod": "^4.0.0"
   }
