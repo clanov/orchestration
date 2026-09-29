@@ -2,15 +2,61 @@
 
 ## Purpose
 
-orchestration coordinates a frontier Lead with one or more persistent native coding-agent Sidekicks.
+orchestration pairs a frontier Lead with one persistent native coding-agent Sidekick.
 
-The Lead owns planning, ambiguity, architectural judgment, final review, and integration approval. Sidekicks execute bounded work in isolated git worktrees, can use native subagents, and can ask the Lead when judgment is required.
+The Lead owns planning, ambiguity, architecture, judgment, final review, and integration approval. The Sidekick keeps its own implementation context and isolated worktree across repeated handoffs.
 
 Dynamic model switching at compaction boundaries remains intentionally out of scope.
 
-## Delegation snapshot
+## Design basis
 
-The source checkout may already contain uncommitted work. Delegation therefore captures a complete non-ignored repository snapshot without stashing or changing the Lead checkout.
+This shape follows the public Devin Fusion material more closely than a generic worker-pool design:
+
+- Fusion is described as two parallel agents with separate persistent contexts and tools: a frontier Lead plus one cost-effective Sidekick.
+- The Lead and Sidekick exchange briefs, results, and feedback rather than full transcripts.
+- Cognition's 3,000-run analysis describes roughly three handoffs per run to the same persistent Sidekick, including exploration, implementation, and review feedback.
+- Cognition separately warns that parallel writers fragment implicit decisions; its broader multi-agent guidance favors single-threaded writes unless work is genuinely independent.
+
+Primary references:
+
+- https://cognition.com/blog/devin-fusion
+- https://cognition.com/blog/local-fusion
+- https://cognition.com/blog/making-fable-cheaper-than-opus
+- https://cognition.com/blog/multi-agents-working
+
+## Session topology
+
+```text
+User
+  |
+  v
+Lead
+  |
+  | start_sidekick once
+  v
+Persistent Sidekick
+same native session + same isolated worktree
+  |
+  +-- handoff: explore
+  |      |
+  |      +--> result
+  |
+  +-- handoff: implement / test
+  |      |
+  |      +--> result
+  |
+  +-- handoff: Lead review feedback
+         |
+         +--> revised result
+```
+
+A Lead should not map each bug, file, or CI failure to a fresh worker. The persistent Sidekick is the unit of collaboration.
+
+The MCP process selects one reachable runtime before exposing the Sidekick. Runtime choice is therefore configuration, not a per-handoff Lead decision.
+
+## Initial snapshot
+
+The source checkout may already contain uncommitted work. Starting the Sidekick captures a complete non-ignored repository snapshot without stashing or changing the Lead checkout.
 
 ```text
 Lead HEAD + tracked dirty + untracked
@@ -24,45 +70,47 @@ Lead HEAD + tracked dirty + untracked
 
 The synthetic commit is created with an alternate temporary git index. It never changes the Lead branch or staging area.
 
-All Sidekick diffs and verifier checks compare against `snapshotCommit`, not the original `baseCommit`. Therefore edits that already existed at delegation time are not attributed to the Sidekick.
+All Sidekick diffs and verifier checks compare against `snapshotCommit`, not the original `baseCommit`. Pre-existing Lead edits are therefore not attributed to the Sidekick.
 
-## Concurrent topology
+Every later `handoff` continues from this same worktree. The Sidekick delta is cumulative across the session.
 
-```text
-                         Lead
-                plan / judgment / review
-                 /                  \
-        delegate task A        delegate task B
-              |                     |
-              v                     v
-      Worktree A snapshot     Worktree B snapshot
-          Sidekick A              Sidekick B
-           /     \                   |
-      subagent subagent           subagent
-              |
-        lead question
-              |
-              +--------------------> Lead
-```
+## Handoff loop
 
-Each task snapshots the Lead independently. Sidekick A and B may therefore begin from different source states if the Lead changed files between the two delegations.
+The collaboration loop is intentionally small:
+
+1. Lead sends a brief with outcome, constraints, and success criteria.
+2. Sidekick explores/implements/tests in its own context and worktree.
+3. Sidekick returns a result or a material judgment question.
+4. Harness verifies the work independently.
+5. Lead reviews the result/diff.
+6. Lead either sends another `handoff`, answers with `reply_to_sidekick`, or prepares integration.
+
+This lets the Lead remain expensive where judgment matters while avoiding repeated Lead-side implementation and rereading.
+
+## Native subagents
+
+Runtime-native subagents are not the primary orchestration layer.
+
+By default the Sidekick is instructed to keep writes single-threaded. Native subagents may be useful for clean-context read-only exploration or verification, but parallel writing agents require an explicit Lead decision.
+
+This avoids turning the Sidekick itself into another unmanaged worker swarm.
 
 ## Verification
 
-After a successful Sidekick turn:
+After every successful Sidekick turn:
 
 1. run explicit `verificationCommands`
 2. run `git diff --check <snapshotCommit>`
-3. capture the final Sidekick delta
+3. capture the cumulative Sidekick delta
 4. enforce `protectedPaths`
 
-The worker's own "tests passed" statement does not affect verifier state.
+The Sidekick's own "tests passed" statement does not affect verifier state.
 
-A failed verifier result keeps the same Sidekick session and worktree available for `follow_up`.
+A failed verifier result keeps the same native session and worktree available for `handoff`.
 
 ## Guarded integration
 
-Integration is a two-phase protocol.
+Integration remains two-phase.
 
 ### prepare_apply
 
@@ -73,16 +121,14 @@ task.state == completed
 verification.status == passed
 ```
 
-The workspace layer creates a synthetic result commit from the Sidekick's current files and computes:
+The workspace layer creates a synthetic result commit from the current Sidekick worktree and computes:
 
 ```text
 Sidekick delta =
   diff(snapshotCommit, resultCommit)
 ```
 
-This delta includes new/untracked files because the synthetic result commit is built from the whole non-ignored working tree.
-
-The Lead workspace is fingerprinted with another temporary-index tree object:
+The Lead workspace is fingerprinted with:
 
 ```text
 sourceHead
@@ -90,27 +136,13 @@ sourceTree
 sourceDirty
 ```
 
-Preflight then runs:
+Preflight runs `git apply --check` against the current Lead working tree and returns a one-use plan id.
 
-```text
-git apply --check
-```
-
-against the Lead's current working tree.
-
-The preview also reports:
-
-- `headDiverged` — current Lead HEAD differs from delegation base HEAD
-- `sourceChangedSinceDelegation` — current Lead content tree differs from the delegation snapshot
-- `canApply`
-- conflict reason, when present
-- patch hash and affected files
-
-No Lead file is changed during preflight.
+No Lead file changes during preflight.
 
 ### apply_to_lead
 
-`prepare_apply` returns a random plan id. Applying requires:
+Applying requires:
 
 ```text
 taskId
@@ -118,35 +150,21 @@ planId
 confirm=true
 ```
 
-Before mutation, orchestration recomputes both sides.
+Before mutation, orchestration recomputes both sides. It rejects the operation if the Sidekick delta, Lead HEAD, Lead content fingerprint, or apply preflight changed.
 
-The operation is rejected if:
-
-- task is no longer verified/completed
-- Sidekick delta changed
-- Lead `HEAD` changed
-- Lead content fingerprint changed
-- preflight no longer passes
-
-This closes the review-to-apply race.
-
-If guards still match, orchestration runs `git apply` against the Lead checkout.
-
-It intentionally does **not** stage or commit the result. The Lead/human keeps ownership of the final git history.
+If guards still match, orchestration applies the patch to the Lead checkout. It does not stage, commit, or push.
 
 ## Durable state and restart recovery
 
-Task state is persisted in SQLite after every state/event transition. The default database is:
+State is persisted in SQLite after every state/event transition:
 
 ```text
 ~/.orchestration/state.sqlite
 ```
 
-Persisted state includes the worker name/model, task brief, native session id, worktree lease, verification history, event history, and guarded-apply plan. Worker secrets and API keys are never written into the database.
+Persisted state includes the selected runtime name, task brief, native session id, worktree lease, verification history, event history, and guarded-apply plan. Runtime credentials are not persisted.
 
-On process startup, completed/waiting/failed/applied tasks are restored as-is. A task that was active when the process stopped is restored as `interrupted` with its prior active state recorded in `interruptedFrom`.
-
-`resume_task` then uses the preserved worktree. If a native session id was already known, it continues that same session. If the process died before a session id was recorded but the worktree exists, recovery can start a new native session in that preserved worktree. If no durable worktree was recorded, recovery refuses to silently take a new snapshot and the Lead must delegate a fresh task.
+An active session restored after MCP restart becomes `interrupted`. `resume_task` reuses the preserved worktree and the native runtime session id when it was already known.
 
 ## State model
 
@@ -158,11 +176,12 @@ queued
             -> running
        -> verifying
             -> completed
-                 -> prepare_apply
-                 -> applied
+                 -> handoff -> running
+                 -> prepare_apply -> applied
             -> verification_failed
-                 -> running
+                 -> handoff -> running
        -> failed
+            -> handoff -> running
        -> cancelled
 
 active state + process restart
@@ -171,27 +190,17 @@ active state + process restart
             -> running / verifying
 ```
 
-`prepare_apply` itself leaves the state at `completed`; it only creates a one-use approval plan.
-
-## Native subagents
-
-- OpenCode: native subagents, nesting controlled by runtime permissions/configuration.
-- Antigravity: parallel native subagents; exact nesting remains runtime-defined.
-- Command Code: parallel native subagents, one level deep.
-
-All child agents operate under the Sidekick runtime's isolated working directory.
-
 ## MCP surface
 
-- `list_workers`
+- `sidekick_status`
 - `list_tasks`
-- `delegate`
+- `start_sidekick`
+- `handoff`
 - `get_events`
 - `get_result`
 - `get_diff`
+- `reply_to_sidekick`
 - `resume_task`
-- `reply_to_worker`
-- `follow_up`
 - `prepare_apply`
 - `apply_to_lead`
 - `cancel`
@@ -201,23 +210,20 @@ All child agents operate under the Sidekick runtime's isolated working directory
 ## Safety invariants
 
 1. Lead and Sidekick never share a writable checkout.
-2. A Sidekick delta is measured from the exact delegation snapshot.
-3. Verification is harness-owned.
-4. Only verified tasks may enter apply preflight.
-5. Preflight does not mutate the Lead workspace.
-6. Apply requires an explicit, matching approval plan.
-7. Lead/Sidekick changes after preflight invalidate that plan.
-8. Apply never commits or stages automatically.
-9. Provider credentials remain outside orchestration state.
-10. Compaction-time model switching is deferred.
-
-## Runtime readiness
-
-Node 22.5+ is required for the built-in `node:sqlite` state store. `npm run doctor` checks Node/Git, the SQLite state database, configured native runtimes, and provider credential presence. CI builds the full TypeScript project and runs a smoke test that exercises dirty-source snapshotting, Sidekick-only diffs, guarded apply, and SQLite persistence.
+2. One Lead workspace has one persistent writing Sidekick by default.
+3. A Sidekick delta is measured from the exact initial snapshot.
+4. Verification is harness-owned.
+5. Only verified work may enter apply preflight.
+6. Preflight does not mutate the Lead workspace.
+7. Apply requires explicit matching approval.
+8. Lead/Sidekick changes after preflight invalidate that approval.
+9. Apply never commits, stages, or pushes automatically.
+10. Runtime credentials stay outside durable orchestration state.
+11. Compaction-time model switching is deferred.
 
 ## Planned layers
 
 1. native streaming and subagent telemetry
-2. rule-based routing and automatic escalation
+2. rule-based escalation and compaction-time routing
 3. execution telemetry and Lead-rework metrics
-4. adaptive routing based on observed outcomes
+4. explicit higher-level fan-out for genuinely independent work
