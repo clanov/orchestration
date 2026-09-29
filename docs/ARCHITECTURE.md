@@ -2,71 +2,31 @@
 
 ## Purpose
 
-orchestration is a local coordination layer between a frontier lead and one or more native coding-agent sidekicks.
+orchestration coordinates a frontier Lead with one or more persistent native coding-agent Sidekicks.
 
-The current architecture implements the core Lead/Sidekick shape:
+The Lead owns planning, ambiguity, architectural judgment, final review, and integration approval. Sidekicks execute bounded work in isolated git worktrees, can use native subagents, and can ask the Lead when judgment is required.
 
-- Lead owns planning, ambiguity, architectural judgment, and final review.
-- Sidekick owns bounded execution.
-- Both keep independent persistent contexts.
-- Lead and Sidekick run concurrently.
-- Sidekick can ask the Lead instead of guessing through a material judgment call.
-- Sidekick can use runtime-native subagents.
-- Sidekick writes are isolated in per-task git worktrees.
-- Completion is checked by a verifier owned by the orchestration harness.
+Dynamic model switching at compaction boundaries remains intentionally out of scope.
 
-Dynamic model switching at context compaction boundaries remains intentionally out of scope.
+## Delegation snapshot
 
-## Worktree isolation and snapshots
-
-For each delegated task:
-
-1. Resolve the source git repository.
-2. Capture current `HEAD` as an immutable `baseCommit`.
-3. Capture tracked staged/unstaged changes as a binary git patch.
-4. Capture non-ignored untracked files.
-5. Create a detached worktree outside the source repository at `baseCommit`.
-6. Apply the tracked patch and copy the untracked files into it.
-7. Preserve the caller's relative subdirectory and launch the Sidekick there.
-
-The Lead checkout is never stashed or mutated by this process.
-
-This creates snapshot-at-delegation semantics:
+The source checkout may already contain uncommitted work. Delegation therefore captures a complete non-ignored repository snapshot without stashing or changing the Lead checkout.
 
 ```text
-T0 source state ----------> Sidekick worktree A
-       |
-       | Lead continues editing
-       v
-T1 source state ----------> Sidekick worktree B
+Lead HEAD + tracked dirty + untracked
+                  |
+                  v
+          isolated worktree
+                  |
+                  v
+        synthetic snapshot commit
 ```
 
-A and B can therefore start from different snapshots while the Lead continues working.
+The synthetic commit is created with an alternate temporary git index. It never changes the Lead branch or staging area.
 
-Ignored files are intentionally excluded. Dependency caches and build artifacts should be recreated or shared later through an explicit workspace optimization layer.
+All Sidekick diffs and verifier checks compare against `snapshotCommit`, not the original `baseCommit`. Therefore edits that already existed at delegation time are not attributed to the Sidekick.
 
-### Base-relative review
-
-The captured `baseCommit` remains the review baseline. Diffs therefore include both source changes that existed at delegation time and changes subsequently made by the Sidekick. This is intentional: the isolated worktree represents the complete snapshot the Sidekick was asked to work from.
-
-## Verification
-
-After each successful Sidekick turn, orchestration enters `verifying`.
-
-Verification order:
-
-1. explicit `verificationCommands`
-2. `git diff --check <baseCommit>`
-3. capture the final changed/untracked file set
-4. enforce `protectedPaths`
-
-Project checks run before the final snapshot because tests, generators, or formatters may themselves alter the worktree.
-
-Each command produces a receipt with command, exit code, duration, and bounded stdout/stderr tails.
-
-If any command fails or a protected path was changed, state becomes `verification_failed`. The Lead can inspect the report and call `follow_up`; the same native Sidekick session and worktree are reused and then verified again.
-
-## Execution topology
+## Concurrent topology
 
 ```text
                          Lead
@@ -85,6 +45,95 @@ If any command fails or a protected path was changed, state becomes `verificatio
               +--------------------> Lead
 ```
 
+Each task snapshots the Lead independently. Sidekick A and B may therefore begin from different source states if the Lead changed files between the two delegations.
+
+## Verification
+
+After a successful Sidekick turn:
+
+1. run explicit `verificationCommands`
+2. run `git diff --check <snapshotCommit>`
+3. capture the final Sidekick delta
+4. enforce `protectedPaths`
+
+The worker's own "tests passed" statement does not affect verifier state.
+
+A failed verifier result keeps the same Sidekick session and worktree available for `follow_up`.
+
+## Guarded integration
+
+Integration is a two-phase protocol.
+
+### prepare_apply
+
+Allowed only when:
+
+```text
+task.state == completed
+verification.status == passed
+```
+
+The workspace layer creates a synthetic result commit from the Sidekick's current files and computes:
+
+```text
+Sidekick delta =
+  diff(snapshotCommit, resultCommit)
+```
+
+This delta includes new/untracked files because the synthetic result commit is built from the whole non-ignored working tree.
+
+The Lead workspace is fingerprinted with another temporary-index tree object:
+
+```text
+sourceHead
+sourceTree
+sourceDirty
+```
+
+Preflight then runs:
+
+```text
+git apply --check
+```
+
+against the Lead's current working tree.
+
+The preview also reports:
+
+- `headDiverged` — current Lead HEAD differs from delegation base HEAD
+- `sourceChangedSinceDelegation` — current Lead content tree differs from the delegation snapshot
+- `canApply`
+- conflict reason, when present
+- patch hash and affected files
+
+No Lead file is changed during preflight.
+
+### apply_to_lead
+
+`prepare_apply` returns a random plan id. Applying requires:
+
+```text
+taskId
+planId
+confirm=true
+```
+
+Before mutation, orchestration recomputes both sides.
+
+The operation is rejected if:
+
+- task is no longer verified/completed
+- Sidekick delta changed
+- Lead `HEAD` changed
+- Lead content fingerprint changed
+- preflight no longer passes
+
+This closes the review-to-apply race.
+
+If guards still match, orchestration runs `git apply` against the Lead checkout.
+
+It intentionally does **not** stage or commit the result. The Lead/human keeps ownership of the final git history.
+
 ## State model
 
 ```text
@@ -95,46 +144,56 @@ queued
             -> running
        -> verifying
             -> completed
+                 -> prepare_apply
+                 -> applied
             -> verification_failed
                  -> running
        -> failed
        -> cancelled
 ```
 
-## Diff review
-
-`get_diff` compares the current isolated worktree against its captured base commit.
-
-It returns changed files, untracked files, diff stat, bounded patch text, and a truncation flag.
-
-The patch is currently the Git-tracked diff. Untracked file names are reported separately; the Lead can inspect them directly through the returned worktree path.
+`prepare_apply` itself leaves the state at `completed`; it only creates a one-use approval plan.
 
 ## Native subagents
 
-- OpenCode: subagents and Task permissions; nesting is configuration/runtime-defined.
-- Antigravity: parallel native subagents; exact nesting is runtime-defined.
-- Command Code: parallel subagents, one level deep.
+- OpenCode: native subagents, nesting controlled by runtime permissions/configuration.
+- Antigravity: parallel native subagents; exact nesting remains runtime-defined.
+- Command Code: parallel native subagents, one level deep.
 
-All native child agents inherit the Sidekick runtime's isolated working directory semantics.
+All child agents operate under the Sidekick runtime's isolated working directory.
 
-## Lead-question protocol
+## MCP surface
 
-A Sidekick can stop its turn with the `orchestration_lead_query` envelope. The task moves to `waiting_for_lead`; `reply_to_worker` resumes the same native session.
+- `list_workers`
+- `delegate`
+- `get_events`
+- `get_result`
+- `get_diff`
+- `reply_to_worker`
+- `follow_up`
+- `prepare_apply`
+- `apply_to_lead`
+- `cancel`
+- `cleanup`
 
-## Remaining boundary
+## Safety invariants
 
-Worktree isolation prevents write races, and verifier receipts separate claims from evidence. Approved-change integration is intentionally not automatic yet.
-
-A future apply/merge layer should compare the current Lead checkout against the task's `baseCommit`, surface conflicts, and only mutate the Lead workspace after explicit review.
+1. Lead and Sidekick never share a writable checkout.
+2. A Sidekick delta is measured from the exact delegation snapshot.
+3. Verification is harness-owned.
+4. Only verified tasks may enter apply preflight.
+5. Preflight does not mutate the Lead workspace.
+6. Apply requires an explicit, matching approval plan.
+7. Lead/Sidekick changes after preflight invalidate that plan.
+8. Apply never commits or stages automatically.
+9. Provider credentials remain outside orchestration state.
+10. Compaction-time model switching is deferred.
 
 ## Planned layers
 
-1. durable SQLite task/session/worktree registry
+1. durable SQLite task/session/worktree/apply-plan registry
 2. native streaming and subagent telemetry
-3. guarded apply/merge with conflict detection
-4. runtime/provider doctor command
-5. rule-based routing and automatic escalation
-6. execution telemetry and Lead-rework metrics
-7. adaptive routing based on observed outcomes
-
-Compaction-time model switching remains deferred.
+3. doctor command
+4. rule-based routing and automatic escalation
+5. execution telemetry and Lead-rework metrics
+6. adaptive routing based on observed outcomes

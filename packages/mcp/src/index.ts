@@ -11,6 +11,7 @@ import {
 } from "@clanov/orchestration-core";
 import {
   GitWorktreeManager,
+  type ApplyPreview,
   type WorktreeLease,
 } from "@clanov/orchestration-workspace";
 import {
@@ -26,6 +27,7 @@ type TaskState =
   | "verifying"
   | "verification_failed"
   | "completed"
+  | "applied"
   | "failed"
   | "cancelled";
 
@@ -40,6 +42,9 @@ type EventType =
   | "verification_started"
   | "verification_passed"
   | "verification_failed"
+  | "apply_prepared"
+  | "apply_rejected"
+  | "applied"
   | "completed"
   | "failed"
   | "cancelled"
@@ -51,6 +56,12 @@ interface TaskEvent {
   at: string;
   message?: string;
   data?: unknown;
+}
+
+interface ApplyPlan {
+  id: string;
+  createdAt: string;
+  preview: ApplyPreview;
 }
 
 interface TaskRecord {
@@ -66,6 +77,7 @@ interface TaskRecord {
   result?: WorkerRunResult;
   verification?: VerificationReport;
   verificationHistory: VerificationReport[];
+  applyPlan?: ApplyPlan;
   error?: string;
   cancelRequested: boolean;
   events: TaskEvent[];
@@ -81,7 +93,7 @@ export interface OrchestrationServerOptions {
 export function createOrchestrationServer(
   options: OrchestrationServerOptions,
 ): McpServer {
-  const server = new McpServer({ name: "orchestration", version: "0.2.0" });
+  const server = new McpServer({ name: "orchestration", version: "0.3.0" });
   const workers = new Map(options.workers.map((worker) => [worker.name, worker]));
   const tasks = new Map<string, TaskRecord>();
   const workspace = options.workspace ?? new GitWorktreeManager();
@@ -167,7 +179,7 @@ export function createOrchestrationServer(
     "get_result",
     {
       description:
-        "Inspect a delegated task without blocking, including worktree and verification state.",
+        "Inspect a delegated task without blocking, including worktree, verification, and apply-plan state.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
       }),
@@ -207,7 +219,7 @@ export function createOrchestrationServer(
     "get_diff",
     {
       description:
-        "Read the isolated sidekick worktree diff for lead review. The patch is truncated by default; changed/untracked files are always listed.",
+        "Read only the Sidekick-authored delta relative to the Lead snapshot captured at delegation time.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
         maxPatchChars: z.number().int().min(0).max(200_000).optional(),
@@ -251,6 +263,7 @@ export function createOrchestrationServer(
         );
       }
 
+      invalidateApplyPlan(record);
       pushEvent(record, "lead_reply", "Lead replied to sidekick.");
       record.state = "running";
       record.updatedAt = now();
@@ -295,7 +308,13 @@ export function createOrchestrationServer(
       if (record.state === "cancelled") {
         return toolError("Cancelled tasks cannot be resumed.");
       }
+      if (record.state === "applied") {
+        return toolError(
+          "Applied tasks cannot be resumed. Delegate a new task from the updated Lead workspace.",
+        );
+      }
 
+      invalidateApplyPlan(record);
       pushEvent(record, "follow_up", "Lead sent follow-up feedback.");
       record.state = "running";
       record.updatedAt = now();
@@ -303,6 +322,141 @@ export function createOrchestrationServer(
       void continueTask(record, message);
 
       return toolJson(snapshot(record));
+    },
+  );
+
+  server.registerTool(
+    "prepare_apply",
+    {
+      description:
+        "Preflight a verified Sidekick delta against the Lead's current workspace without modifying it. Returns an approval plan id and conflict/divergence details.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+      }),
+    },
+    async ({ taskId }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+      if (!record.workspace) {
+        return toolError("The isolated worktree is not ready.");
+      }
+      if (
+        record.state !== "completed" ||
+        record.verification?.status !== "passed"
+      ) {
+        return toolError(
+          "Only a completed task with a passing harness verification can be prepared for apply.",
+        );
+      }
+
+      try {
+        const preview = await workspace.prepareApply(record.workspace);
+        const plan: ApplyPlan = {
+          id: randomUUID(),
+          createdAt: now(),
+          preview,
+        };
+
+        record.applyPlan = plan;
+        record.updatedAt = now();
+
+        pushEvent(
+          record,
+          "apply_prepared",
+          preview.canApply
+            ? "Apply preflight passed; explicit Lead approval is required."
+            : "Apply preflight found a conflict; Lead workspace was not modified.",
+          {
+            planId: plan.id,
+            ...preview,
+          },
+        );
+
+        return toolJson({
+          taskId,
+          planId: plan.id,
+          approvalRequired: true,
+          ...preview,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        pushEvent(record, "apply_rejected", message);
+        return toolError(message);
+      }
+    },
+  );
+
+  server.registerTool(
+    "apply_to_lead",
+    {
+      description:
+        "Apply a previously preflighted, verified Sidekick delta to the Lead workspace. Requires the exact planId and confirm=true. Refuses stale plans.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+        planId: z.string().uuid(),
+        confirm: z.literal(true),
+      }),
+    },
+    async ({ taskId, planId }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+      if (!record.workspace) {
+        return toolError("The isolated worktree is not ready.");
+      }
+      if (
+        record.state !== "completed" ||
+        record.verification?.status !== "passed"
+      ) {
+        return toolError(
+          "Only a completed task with a passing harness verification can be applied.",
+        );
+      }
+
+      const plan = record.applyPlan;
+      if (!plan || plan.id !== planId) {
+        return toolError(
+          "Apply approval plan is missing or does not match. Run prepare_apply again.",
+        );
+      }
+
+      if (!plan.preview.canApply) {
+        return toolError(
+          plan.preview.conflictReason ??
+            "The prepared Sidekick patch does not apply cleanly.",
+        );
+      }
+
+      try {
+        const result = await workspace.applyPrepared(record.workspace, {
+          patchHash: plan.preview.patchHash,
+          sourceHead: plan.preview.sourceHead,
+          sourceTree: plan.preview.sourceTree,
+        });
+
+        record.applyPlan = undefined;
+        record.state = "applied";
+        record.updatedAt = now();
+
+        pushEvent(
+          record,
+          "applied",
+          result.applied
+            ? "Verified Sidekick delta applied to Lead workspace."
+            : "Sidekick produced no delta; nothing needed to be applied.",
+          result,
+        );
+
+        return toolJson({
+          taskId,
+          state: record.state,
+          ...result,
+        });
+      } catch (error) {
+        record.applyPlan = undefined;
+        const message = error instanceof Error ? error.message : String(error);
+        pushEvent(record, "apply_rejected", message);
+        return toolError(message);
+      }
     },
   );
 
@@ -320,6 +474,7 @@ export function createOrchestrationServer(
       if (!record) return toolError(`Unknown task "${taskId}".`);
 
       record.cancelRequested = true;
+      invalidateApplyPlan(record);
       record.state = "cancelled";
       record.updatedAt = now();
       pushEvent(record, "cancelled", "Cancellation requested.");
@@ -357,6 +512,7 @@ export function createOrchestrationServer(
         return toolJson({ taskId, cleaned: false, reason: "no-worktree" });
       }
 
+      invalidateApplyPlan(record);
       await workspace.remove(record.workspace);
       record.workspace = undefined;
       record.updatedAt = now();
@@ -383,6 +539,7 @@ export function createOrchestrationServer(
       pushEvent(record, "workspace_ready", "Isolated git worktree ready.", {
         worktreeRoot: lease.worktreeRoot,
         baseCommit: lease.baseCommit,
+        snapshotCommit: lease.snapshotCommit,
         sourceWasDirty: lease.sourceWasDirty,
       });
 
@@ -443,6 +600,8 @@ export function createOrchestrationServer(
     record: TaskRecord,
     result: WorkerRunResult,
   ): Promise<void> {
+    invalidateApplyPlan(record);
+
     const leadQuestion =
       result.leadQuestion ?? extractLeadQuestion(result.summary);
 
@@ -483,6 +642,7 @@ export function createOrchestrationServer(
       return;
     }
 
+    invalidateApplyPlan(record);
     record.state = "verifying";
     record.updatedAt = now();
     pushEvent(record, "verification_started", "Harness verification started.");
@@ -512,6 +672,7 @@ export function createOrchestrationServer(
   }
 
   function failTask(record: TaskRecord, error: unknown): void {
+    invalidateApplyPlan(record);
     const message = error instanceof Error ? error.message : String(error);
     record.error = message;
     record.state = "failed";
@@ -539,6 +700,10 @@ function createTask(
     events: [],
     nextSeq: 1,
   };
+}
+
+function invalidateApplyPlan(record: TaskRecord): void {
+  record.applyPlan = undefined;
 }
 
 function pushEvent(
@@ -571,6 +736,7 @@ function snapshot(record: TaskRecord) {
             worktreeRoot: record.workspace.worktreeRoot,
             workerCwd: record.workspace.workerCwd,
             baseCommit: record.workspace.baseCommit,
+            snapshotCommit: record.workspace.snapshotCommit,
             sourceWasDirty: record.workspace.sourceWasDirty,
           },
         }
@@ -583,6 +749,15 @@ function snapshot(record: TaskRecord) {
       : {}),
     ...(record.result ? { result: record.result } : {}),
     ...(record.verification ? { verification: record.verification } : {}),
+    ...(record.applyPlan
+      ? {
+          applyPlan: {
+            planId: record.applyPlan.id,
+            createdAt: record.applyPlan.createdAt,
+            ...record.applyPlan.preview,
+          },
+        }
+      : {}),
     ...(record.error ? { error: record.error } : {}),
     latestEventSeq: record.events.at(-1)?.seq ?? 0,
   };

@@ -2,7 +2,7 @@
 
 A local-first coordination layer for coding agents.
 
-Keep your strongest model in the lead. Let persistent native coding-agent sidekicks execute in parallel, fan out to their own subagents, ask the lead when judgment is needed, and work in isolated git worktrees that the harness verifies independently.
+Keep your strongest model in the lead. Let persistent native coding-agent sidekicks execute in parallel, fan out to their own subagents, ask the lead when judgment is needed, work in isolated git worktrees, and only bring verified changes back through an explicit guarded apply.
 
 > Early alpha. The repository is being bootstrapped in private before its first public release.
 
@@ -21,6 +21,13 @@ Keep your strongest model in the lead. Let persistent native coding-agent sideki
       subagent subagent          subagent(s)
               \                     /
                +---- ask lead ------+
+
+Sidekick result
+  -> harness verify
+  -> Lead review
+  -> prepare_apply (no mutation)
+  -> explicit Lead approval
+  -> apply_to_lead
 ```
 
 The project is inspired by Cognition's lead/sidekick Fusion pattern, but is independent and not affiliated with Cognition or Devin.
@@ -29,92 +36,119 @@ Dynamic model switching during context compaction is deliberately **not implemen
 
 ## What is implemented
 
-- **Asynchronous Lead + Sidekick execution.** `delegate` returns a task ID immediately.
-- **Persistent sidekick sessions.** Lead replies and follow-ups resume the same native session.
-- **Sidekick -> Lead questions.** Material judgment calls can enter `waiting_for_lead`.
-- **Sidekick -> native Subagents.** Runtime-native agent hierarchies remain available.
-- **Per-task git worktree isolation.** Every delegated task gets its own detached worktree.
-- **Snapshot-at-delegation.** Tracked staged/unstaged changes plus non-ignored untracked files are copied into the Sidekick worktree without stashing or mutating the Lead checkout.
-- **Harness-owned verification.** Explicit project checks, `git diff --check`, and protected-path checks run outside the sidekick's self-report.
-- **Lead diff review.** `get_diff` exposes changed files, untracked files, diff stat, and a bounded patch.
-- **Verification repair loop.** A failed verifier result can be sent back with `follow_up` while preserving the same sidekick session and worktree.
+- **Asynchronous Lead + Sidekick execution.**
+- **Persistent Sidekick sessions.**
+- **Sidekick -> Lead questions.**
+- **Sidekick -> native Subagents.**
+- **Per-task git worktree isolation.**
+- **Snapshot-at-delegation**, including tracked staged/unstaged changes and non-ignored untracked files.
+- **Sidekick-only diffs.** An immutable synthetic snapshot commit separates pre-existing Lead edits from changes authored after delegation.
+- **Harness-owned verification.**
+- **Two-phase guarded apply** back into the Lead workspace.
 
-## Concurrent snapshot semantics
+## Guarded apply
 
-Delegation captures the Lead's repository state **at that moment**:
+Applying a Sidekick result is deliberately two-phase.
+
+### 1. Preflight
 
 ```text
-Lead worktree at T0
-  ├─ HEAD
-  ├─ tracked staged/unstaged changes
-  └─ non-ignored untracked files
-          |
-          | snapshot
-          v
-Sidekick isolated worktree
-
-T1:
-Lead keeps editing original checkout
-Sidekick keeps editing isolated snapshot
+prepare_apply(taskId)
 ```
 
-This allows a Lead to keep working and to launch additional Sidekicks even when its own checkout has become dirty.
+This does **not** modify the Lead workspace. It:
 
-Ignored files such as dependency/build caches are not copied. A Sidekick may need the runtime/project setup step appropriate for a fresh worktree.
+- requires a completed task with passing harness verification
+- computes only the Sidekick delta from the captured delegation snapshot
+- fingerprints the current Lead `HEAD` and working-tree contents
+- reports whether the Lead diverged since delegation
+- runs `git apply --check` against the Lead's current files
+- returns a one-use `planId`
+
+Example result:
+
+```text
+canApply: true
+headDiverged: true
+sourceChangedSinceDelegation: true
+sourceDirty: true
+patchHash: ...
+planId: ...
+approvalRequired: true
+```
+
+Divergence is informational. If the Sidekick touched different lines/files, a patch may still apply cleanly.
+
+### 2. Explicit approval
+
+```text
+apply_to_lead(
+  taskId,
+  planId,
+  confirm=true
+)
+```
+
+Before modifying anything, orchestration recomputes the Sidekick patch and Lead workspace fingerprint.
+
+If either changed after preflight, the plan is rejected as stale and the Lead must run `prepare_apply` again.
+
+Only then does it perform the patch apply. Changes are written into the Lead working tree but are **not automatically committed or staged**.
+
+## Snapshot semantics
+
+At delegation:
+
+```text
+Lead state at T0
+  ├─ HEAD
+  ├─ staged/unstaged tracked files
+  └─ non-ignored untracked files
+          |
+          v
+   synthetic snapshot commit
+          |
+          v
+   isolated Sidekick worktree
+```
+
+The synthetic snapshot commit is not checked out on the Lead branch. It exists only as an immutable comparison point.
+
+This fixes an important integration problem: if the Lead already had edits before delegation, those edits are not mistaken for Sidekick-authored changes when reviewing or applying the result.
+
+## Verification
+
+Every successful Sidekick turn triggers:
+
+```text
+verificationCommands
+git diff --check <delegation snapshot>
+protectedPaths check
+```
+
+A task reaches `completed` only after verification passes.
+
+A verification failure can be returned to the same Sidekick/session/worktree with `follow_up`.
 
 ## MCP tools
 
 | Tool | Purpose |
 | --- | --- |
 | `list_workers` | Runtime and subagent capabilities |
-| `delegate` | Start an isolated sidekick asynchronously |
-| `get_events` | Monitor task/lead-question/verification events |
-| `get_result` | Current task + verification state |
-| `get_diff` | Review the sidekick worktree diff |
+| `delegate` | Start an isolated Sidekick asynchronously |
+| `get_events` | Monitor task and verification events |
+| `get_result` | Inspect task state |
+| `get_diff` | Review Sidekick-only delta |
 | `reply_to_worker` | Answer a Sidekick judgment question |
-| `follow_up` | Continue the same Sidekick after review or verifier failure |
-| `cancel` | Stop a delegated task, preserving its worktree |
-| `cleanup` | Remove an inactive isolated worktree |
-
-## Verification
-
-The verifier does not trust a worker saying "tests pass".
-
-Every completed worker turn triggers:
-
-```text
-each verificationCommands entry supplied in the brief
-git diff --check <base>
-protectedPaths check against the final worktree
-```
-
-Project checks run first because tests/formatters can themselves update files. The final diff and protected-path inspection happen afterwards.
-
-A task only enters `completed` when these checks pass.
-
-If they fail:
-
-```text
-running
-  -> verifying
-  -> verification_failed
-       |
-       | Lead reviews receipts
-       v
-    follow_up
-       |
-       v
-    same Sidekick session/worktree
-       |
-       v
-    verifying again
-```
-
-Verification commands are explicit commands supplied in the delegation brief. orchestration does not currently guess a project's test command.
+| `follow_up` | Continue the same Sidekick |
+| `prepare_apply` | Conflict/divergence preflight; no Lead mutation |
+| `apply_to_lead` | Explicitly approved guarded apply |
+| `cancel` | Cancel and preserve worktree |
+| `cleanup` | Remove inactive worktree |
 
 ## Worktree lifecycle
 
-Worktrees default under the operating system temp directory:
+Worktrees default under:
 
 ```text
 <tmp>/orchestration/worktrees/<repo>-<hash>/<task-id>
@@ -126,8 +160,6 @@ Override with:
 ORCHESTRATION_WORKTREE_ROOT=/path/to/worktrees
 ```
 
-Completed/failed/cancelled worktrees are preserved for review. Call `cleanup` when the Lead no longer needs them.
-
 ## Supported runtimes
 
 | Runtime | Persistent session | Parallel subagents | Nesting |
@@ -138,13 +170,11 @@ Completed/failed/cancelled worktrees are preserved for review. Call `cleanup` wh
 
 ## Provider credentials
 
-The provider registry detects, but does not persist:
+Detected but not persisted:
 
 - `GEMINI_API_KEY`
 - `OPENAI_API_KEY`
 - `OPENROUTER_API_KEY`
-
-Authentication remains owned by the native runtime/provider.
 
 ## Development
 
@@ -158,14 +188,16 @@ npm run typecheck
 
 ## Status
 
-The current safety boundary is now:
+The current safety boundary is:
 
 ```text
 Lead workspace != Sidekick workspace
 Sidekick claim != verification result
+review != apply
+preflight != approval
 ```
 
-Still planned: durable SQLite task state, native streaming/subagent telemetry, guarded merge/apply, and routing/escalation policy.
+Still planned: durable SQLite state, native streaming/subagent telemetry, doctor command, and automatic routing/escalation policy.
 
 ## License
 

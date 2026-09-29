@@ -52,8 +52,6 @@ export class WorktreeVerifier {
     const startedAt = new Date().toISOString();
     const checks: VerificationReceipt[] = [];
 
-    // Explicit project checks may themselves generate or update files, so they
-    // run before the final diff snapshot/protected-path inspection.
     for (const command of brief.verificationCommands ?? []) {
       checks.push(
         await runShellCheck(
@@ -69,7 +67,7 @@ export class WorktreeVerifier {
       await runExecutableCheck(
         "git diff --check",
         "git",
-        ["diff", "--check", lease.baseCommit, "--"],
+        ["diff", "--check", lease.snapshotCommit, "--"],
         lease.worktreeRoot,
         this.commandTimeoutMs,
         this.outputTailChars,
