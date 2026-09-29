@@ -10,7 +10,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { SqliteStateStore } from "../packages/state/dist/index.js";
-import { GitWorktreeManager } from "../packages/workspace/dist/index.js";
+import { GitWorktreeManager, resolveSourceCwd } from "../packages/workspace/dist/index.js";
+
+if (process.platform !== "win32") {
+  assert.equal(
+    resolveSourceCwd("C:\\Users\\sky13\\Documents\\CLANOV-Portal"),
+    "/mnt/c/Users/sky13/Documents/CLANOV-Portal",
+  );
+}
 
 const root = mkdtempSync(path.join(tmpdir(), "orchestration-smoke-"));
 const repo = path.join(root, "repo");
