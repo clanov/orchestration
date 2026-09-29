@@ -113,12 +113,12 @@ Replace `/home/user` with the actual WSL home path.
 
 ## 5. Lead workflow
 
-The Lead starts one Sidekick for a workspace and keeps reusing it:
+The Lead only creates a Sidekick when there is actually delegable work. The first `handoff` creates it lazily, and later handoffs keep reusing it:
 
 ```text
 sidekick_status
    |
-start_sidekick
+handoff        <- first call creates Sidekick/session/worktree
    |
 get_events / get_result
    |
@@ -142,7 +142,7 @@ apply_to_lead(confirm=true)
 cleanup
 ```
 
-Do not start a new Sidekick for every bug, file, or test failure. Use `handoff` to send the next implementation brief or review feedback to the existing Sidekick.
+Do not force delegation for short or judgment-heavy work. When there is delegable execution work, use `handoff`; later calls automatically continue the same native session and worktree.
 
 ## Restart recovery
 
