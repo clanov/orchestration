@@ -23,6 +23,8 @@
     "@clanov/orchestration-adapter-opencode": "0.0.0",
     "@clanov/orchestration-core": "0.0.0",
     "@clanov/orchestration-providers": "0.0.0",
+    "@clanov/orchestration-verifier": "0.0.0",
+    "@clanov/orchestration-workspace": "0.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "zod": "^4.0.0"
   }

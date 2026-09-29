@@ -8,6 +8,8 @@
   "references": [
     { "path": "../core" },
     { "path": "../providers" },
+    { "path": "../workspace" },
+    { "path": "../verifier" },
     { "path": "../adapters/opencode" },
     { "path": "../adapters/antigravity" },
     { "path": "../adapters/command-code" }

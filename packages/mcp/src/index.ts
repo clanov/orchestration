@@ -9,24 +9,41 @@ import {
   type WorkerRunResult,
   type WorkerSession,
 } from "@clanov/orchestration-core";
+import {
+  GitWorktreeManager,
+  type WorktreeLease,
+} from "@clanov/orchestration-workspace";
+import {
+  WorktreeVerifier,
+  type VerificationReport,
+} from "@clanov/orchestration-verifier";
 
 type TaskState =
   | "queued"
+  | "preparing_workspace"
   | "running"
   | "waiting_for_lead"
+  | "verifying"
+  | "verification_failed"
   | "completed"
   | "failed"
   | "cancelled";
 
 type EventType =
   | "task_queued"
+  | "workspace_preparing"
+  | "workspace_ready"
   | "worker_session_ready"
   | "lead_question"
   | "lead_reply"
   | "follow_up"
+  | "verification_started"
+  | "verification_passed"
+  | "verification_failed"
   | "completed"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "workspace_cleaned";
 
 interface TaskEvent {
   seq: number;
@@ -39,11 +56,16 @@ interface TaskEvent {
 interface TaskRecord {
   id: string;
   worker: WorkerAdapter;
+  sourceCwd: string;
+  brief: TaskBrief;
   state: TaskState;
   createdAt: string;
   updatedAt: string;
+  workspace?: WorktreeLease;
   session?: WorkerSession;
   result?: WorkerRunResult;
+  verification?: VerificationReport;
+  verificationHistory: VerificationReport[];
   error?: string;
   cancelRequested: boolean;
   events: TaskEvent[];
@@ -52,14 +74,18 @@ interface TaskRecord {
 
 export interface OrchestrationServerOptions {
   workers: WorkerAdapter[];
+  workspace?: GitWorktreeManager;
+  verifier?: WorktreeVerifier;
 }
 
 export function createOrchestrationServer(
   options: OrchestrationServerOptions,
 ): McpServer {
-  const server = new McpServer({ name: "orchestration", version: "0.1.0" });
+  const server = new McpServer({ name: "orchestration", version: "0.2.0" });
   const workers = new Map(options.workers.map((worker) => [worker.name, worker]));
   const tasks = new Map<string, TaskRecord>();
+  const workspace = options.workspace ?? new GitWorktreeManager();
+  const verifier = options.verifier ?? new WorktreeVerifier(workspace);
 
   server.registerTool(
     "list_workers",
@@ -81,7 +107,7 @@ export function createOrchestrationServer(
     "delegate",
     {
       description:
-        "Start a sidekick asynchronously. Returns a taskId immediately so the lead can keep working in parallel. Poll get_events/get_result later.",
+        "Start a sidekick asynchronously in an isolated git worktree. Returns a taskId immediately so the lead can keep working in parallel.",
       inputSchema: z.object({
         worker: z.string(),
         cwd: z.string(),
@@ -127,15 +153,11 @@ export function createOrchestrationServer(
           : {}),
       };
 
-      const record = createTask(worker);
+      const record = createTask(worker, input.cwd, brief);
       tasks.set(record.id, record);
       pushEvent(record, "task_queued", "Sidekick task queued.");
 
-      void startTask(record, {
-        cwd: input.cwd,
-        brief,
-        ...(input.model ? { model: input.model } : {}),
-      });
+      void startTask(record, input.model);
 
       return toolJson(snapshot(record));
     },
@@ -145,7 +167,7 @@ export function createOrchestrationServer(
     "get_result",
     {
       description:
-        "Inspect a delegated task without blocking. If status is waiting_for_lead, answer it with reply_to_worker.",
+        "Inspect a delegated task without blocking, including worktree and verification state.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
       }),
@@ -161,7 +183,7 @@ export function createOrchestrationServer(
     "get_events",
     {
       description:
-        "Read task events emitted while the lead and sidekick run concurrently. lead_question events require a reply_to_worker call.",
+        "Read incremental task events while the lead and sidekick run concurrently.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
         after: z.number().int().nonnegative().optional(),
@@ -182,10 +204,36 @@ export function createOrchestrationServer(
   );
 
   server.registerTool(
+    "get_diff",
+    {
+      description:
+        "Read the isolated sidekick worktree diff for lead review. The patch is truncated by default; changed/untracked files are always listed.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+        maxPatchChars: z.number().int().min(0).max(200_000).optional(),
+      }),
+    },
+    async ({ taskId, maxPatchChars }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+      if (!record.workspace) {
+        return toolError("The isolated worktree is not ready yet.");
+      }
+
+      return toolJson(
+        await workspace.inspect(
+          record.workspace,
+          maxPatchChars ?? 40_000,
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
     "reply_to_worker",
     {
       description:
-        "Answer a sidekick's judgment question and resume the same persistent worker session asynchronously.",
+        "Answer a sidekick judgment question and resume the same persistent worker session asynchronously.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
         answer: z.string().min(1),
@@ -217,7 +265,7 @@ export function createOrchestrationServer(
     "follow_up",
     {
       description:
-        "Send non-question feedback to a completed sidekick and resume the same native session asynchronously.",
+        "Send feedback to a completed or verification-failed sidekick and resume the same native session asynchronously.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
         message: z.string().min(1),
@@ -229,9 +277,14 @@ export function createOrchestrationServer(
       if (!record.session) {
         return toolError("The sidekick session is not ready yet.");
       }
-      if (record.state === "running" || record.state === "queued") {
+      if (
+        record.state === "running" ||
+        record.state === "queued" ||
+        record.state === "preparing_workspace" ||
+        record.state === "verifying"
+      ) {
         return toolError(
-          "The sidekick is still running. Use get_events/get_result while the lead continues other work.",
+          "The sidekick task is still active. Use get_events/get_result while the lead continues other work.",
         );
       }
       if (record.state === "waiting_for_lead") {
@@ -256,7 +309,8 @@ export function createOrchestrationServer(
   server.registerTool(
     "cancel",
     {
-      description: "Cancel a delegated sidekick task.",
+      description:
+        "Cancel a delegated sidekick task. The isolated worktree is preserved for inspection until cleanup.",
       inputSchema: z.object({
         taskId: z.string().uuid(),
       }),
@@ -278,17 +332,71 @@ export function createOrchestrationServer(
     },
   );
 
+  server.registerTool(
+    "cleanup",
+    {
+      description:
+        "Remove an inactive task's isolated git worktree after the lead no longer needs its diff.",
+      inputSchema: z.object({
+        taskId: z.string().uuid(),
+      }),
+    },
+    async ({ taskId }) => {
+      const record = tasks.get(taskId);
+      if (!record) return toolError(`Unknown task "${taskId}".`);
+      if (
+        record.state === "queued" ||
+        record.state === "preparing_workspace" ||
+        record.state === "running" ||
+        record.state === "waiting_for_lead" ||
+        record.state === "verifying"
+      ) {
+        return toolError("Cannot clean up an active task.");
+      }
+      if (!record.workspace) {
+        return toolJson({ taskId, cleaned: false, reason: "no-worktree" });
+      }
+
+      await workspace.remove(record.workspace);
+      record.workspace = undefined;
+      record.updatedAt = now();
+      pushEvent(record, "workspace_cleaned", "Isolated worktree removed.");
+
+      return toolJson({ taskId, cleaned: true });
+    },
+  );
+
   return server;
 
   async function startTask(
     record: TaskRecord,
-    input: Parameters<WorkerAdapter["start"]>[0],
+    model: string | undefined,
   ): Promise<void> {
-    record.state = "running";
+    record.state = "preparing_workspace";
     record.updatedAt = now();
+    pushEvent(record, "workspace_preparing", "Preparing isolated git worktree.");
 
     try {
-      const started = await record.worker.start(input);
+      const lease = await workspace.prepare(record.id, record.sourceCwd);
+      record.workspace = lease;
+      record.updatedAt = now();
+      pushEvent(record, "workspace_ready", "Isolated git worktree ready.", {
+        worktreeRoot: lease.worktreeRoot,
+        baseCommit: lease.baseCommit,
+      });
+
+      if (record.cancelRequested) {
+        await workspace.remove(lease);
+        record.workspace = undefined;
+        return;
+      }
+
+      record.state = "running";
+      const started = await record.worker.start({
+        cwd: lease.workerCwd,
+        brief: record.brief,
+        ...(model ? { model } : {}),
+      });
 
       record.session = started.session;
       pushEvent(record, "worker_session_ready", "Native sidekick session ready.", {
@@ -300,7 +408,7 @@ export function createOrchestrationServer(
         return;
       }
 
-      applyResult(record, started.result);
+      await applyResult(record, started.result);
     } catch (error) {
       failTask(record, error);
     }
@@ -324,16 +432,16 @@ export function createOrchestrationServer(
         return;
       }
 
-      applyResult(record, result);
+      await applyResult(record, result);
     } catch (error) {
       failTask(record, error);
     }
   }
 
-  function applyResult(
+  async function applyResult(
     record: TaskRecord,
     result: WorkerRunResult,
-  ): void {
+  ): Promise<void> {
     const leadQuestion =
       result.leadQuestion ?? extractLeadQuestion(result.summary);
 
@@ -350,20 +458,55 @@ export function createOrchestrationServer(
     }
 
     record.result = result;
-    record.state =
-      result.status === "failed"
-        ? "failed"
-        : result.status === "cancelled"
-          ? "cancelled"
-          : "completed";
-    record.updatedAt = now();
 
-    if (record.state === "failed") {
+    if (result.status === "failed") {
+      record.state = "failed";
+      record.updatedAt = now();
       pushEvent(record, "failed", result.summary ?? "Sidekick failed.");
-    } else if (record.state === "cancelled") {
+      return;
+    }
+
+    if (result.status === "cancelled") {
+      record.state = "cancelled";
+      record.updatedAt = now();
       pushEvent(record, "cancelled", result.summary ?? "Sidekick cancelled.");
-    } else {
-      pushEvent(record, "completed", result.summary ?? "Sidekick completed.");
+      return;
+    }
+
+    await verifyTask(record);
+  }
+
+  async function verifyTask(record: TaskRecord): Promise<void> {
+    if (!record.workspace) {
+      failTask(record, new Error("Cannot verify without an isolated worktree."));
+      return;
+    }
+
+    record.state = "verifying";
+    record.updatedAt = now();
+    pushEvent(record, "verification_started", "Harness verification started.");
+
+    try {
+      const report = await verifier.verify(record.workspace, record.brief);
+      record.verification = report;
+      record.verificationHistory.push(report);
+      record.updatedAt = now();
+
+      if (report.status === "passed") {
+        record.state = "completed";
+        pushEvent(record, "verification_passed", "Harness verification passed.", report);
+        pushEvent(record, "completed", record.result?.summary ?? "Sidekick completed.");
+      } else {
+        record.state = "verification_failed";
+        pushEvent(
+          record,
+          "verification_failed",
+          "Harness verification failed. The lead can inspect the report and follow up in the same sidekick session.",
+          report,
+        );
+      }
+    } catch (error) {
+      failTask(record, error);
     }
   }
 
@@ -376,15 +519,22 @@ export function createOrchestrationServer(
   }
 }
 
-function createTask(worker: WorkerAdapter): TaskRecord {
+function createTask(
+  worker: WorkerAdapter,
+  sourceCwd: string,
+  brief: TaskBrief,
+): TaskRecord {
   const createdAt = now();
   return {
     id: randomUUID(),
     worker,
+    sourceCwd,
+    brief,
     state: "queued",
     createdAt,
     updatedAt: createdAt,
     cancelRequested: false,
+    verificationHistory: [],
     events: [],
     nextSeq: 1,
   };
@@ -413,6 +563,16 @@ function snapshot(record: TaskRecord) {
     capabilities: record.worker.capabilities,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
+    ...(record.workspace
+      ? {
+          workspace: {
+            sourceCwd: record.workspace.sourceCwd,
+            worktreeRoot: record.workspace.worktreeRoot,
+            workerCwd: record.workspace.workerCwd,
+            baseCommit: record.workspace.baseCommit,
+          },
+        }
+      : {}),
     ...(record.session
       ? {
           sessionId: record.session.id,
@@ -420,6 +580,7 @@ function snapshot(record: TaskRecord) {
         }
       : {}),
     ...(record.result ? { result: record.result } : {}),
+    ...(record.verification ? { verification: record.verification } : {}),
     ...(record.error ? { error: record.error } : {}),
     latestEventSeq: record.events.at(-1)?.seq ?? 0,
   };

@@ -3,6 +3,8 @@
   "references": [
     { "path": "./packages/core" },
     { "path": "./packages/providers" },
+    { "path": "./packages/workspace" },
+    { "path": "./packages/verifier" },
     { "path": "./packages/adapters/opencode" },
     { "path": "./packages/adapters/antigravity" },
     { "path": "./packages/adapters/command-code" },

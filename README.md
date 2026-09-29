@@ -2,116 +2,141 @@
 
 A local-first coordination layer for coding agents.
 
-Keep your strongest model in the lead. Let persistent native coding-agent sidekicks execute in parallel, fan out to their own subagents, and ask the lead when a judgment call is needed.
+Keep your strongest model in the lead. Let persistent native coding-agent sidekicks execute in parallel, fan out to their own subagents, ask the lead when judgment is needed, and work in isolated git worktrees that the harness verifies independently.
 
 > Early alpha. The repository is being bootstrapped in private before its first public release.
 
 ## Model
 
 ```text
-                    Lead
-             frontier intelligence
-            plan / ambiguity / review
-                     |
-          async delegate / feedback
-             +-------+-------+
-             |               |
-             v               v
-        Sidekick A       Sidekick B
-        persistent       persistent
-          context          context
-          /   \              |
-         v     v             v
-     subagent subagent   subagent(s)
-
-Sidekick -> lead_question -> Lead -> reply -> same sidekick session
+                         Lead
+                plan / judgment / review
+                    /              \
+         async delegate        async delegate
+              |                     |
+              v                     v
+        isolated worktree      isolated worktree
+          Sidekick A             Sidekick B
+           /     \                  |
+      subagent subagent          subagent(s)
+              \                     /
+               +---- ask lead ------+
 ```
 
 The project is inspired by Cognition's lead/sidekick Fusion pattern, but is independent and not affiliated with Cognition or Devin.
 
 Dynamic model switching during context compaction is deliberately **not implemented yet**.
 
-## Supported surfaces
+## What is implemented
 
-Runtime adapters and model providers are intentionally separate.
+- **Asynchronous Lead + Sidekick execution.** `delegate` returns a task ID immediately.
+- **Persistent sidekick sessions.** Lead replies and follow-ups resume the same native session.
+- **Sidekick -> Lead questions.** Material judgment calls can enter `waiting_for_lead`.
+- **Sidekick -> native Subagents.** Runtime-native agent hierarchies remain available.
+- **Per-task git worktree isolation.** Every delegated task starts from the source repository's current `HEAD` in a detached worktree.
+- **Harness-owned verification.** `git diff --check`, protected-path checks, and explicit verification commands run outside the sidekick's self-report.
+- **Lead diff review.** `get_diff` exposes changed files, untracked files, diff stat, and a bounded patch.
+- **Verification repair loop.** A failed verifier result can be sent back with `follow_up` while preserving the same sidekick session and worktree.
 
-| Type | Integration | Status |
-| --- | --- | --- |
-| Runtime | OpenCode | initial adapter |
-| Runtime | Antigravity / `agy` | initial adapter |
-| Runtime | Command Code | initial adapter |
-| Provider credential | Gemini API key | detected via `GEMINI_API_KEY` |
-| Provider credential | OpenAI API key | detected via `OPENAI_API_KEY` |
-| Provider credential | OpenRouter API key | detected via `OPENROUTER_API_KEY` |
+## Important source-worktree rule
 
-Provider credentials are not direct workers yet. orchestration does not persist or proxy these keys.
+Delegation currently requires the source git worktree to be clean.
 
-## Fusion-style behavior implemented
+This is deliberate: an isolated sidekick worktree is created from the current commit. Starting from a dirty source tree would silently omit uncommitted Lead changes.
 
-- **Frontier lead stays in charge.** Planning, ambiguity, judgment, and final review remain with the lead.
-- **Asynchronous delegation.** `delegate` returns immediately with a task ID; the lead keeps working while the sidekick runs.
-- **Persistent sidekick context.** Follow-ups and lead replies resume the same native runtime session.
-- **Briefs instead of transcript copies.** Objective, constraints, acceptance criteria, and bounded context are handed off.
-- **Sidekick -> Lead questions.** A sidekick can stop at a material judgment call, raise `waiting_for_lead`, receive a lead answer, then continue.
-- **Sidekick -> native subagents.** OpenCode, Antigravity, and Command Code keep their own native subagent capabilities.
-- **Capability discovery.** `list_workers` tells the lead which runtime supports parallel/nested subagents.
+```text
+dirty source
+  -> delegate rejected
+
+clean source
+  -> capture HEAD
+  -> create detached sidekick worktree
+  -> Lead and Sidekick can now work independently
+```
+
+Once the task starts, the Lead may continue changing the original worktree. The sidekick remains pinned to its isolated snapshot.
 
 ## MCP tools
 
+| Tool | Purpose |
+| --- | --- |
+| `list_workers` | Runtime and subagent capabilities |
+| `delegate` | Start an isolated sidekick asynchronously |
+| `get_events` | Monitor task/lead-question/verification events |
+| `get_result` | Current task + verification state |
+| `get_diff` | Review the sidekick worktree diff |
+| `reply_to_worker` | Answer a Sidekick judgment question |
+| `follow_up` | Continue the same Sidekick after review or verifier failure |
+| `cancel` | Stop a delegated task, preserving its worktree |
+| `cleanup` | Remove an inactive isolated worktree |
+
+## Verification
+
+The verifier does not trust a worker saying "tests pass".
+
+Every completed worker turn triggers:
+
 ```text
-list_workers
-delegate          -> returns taskId immediately
-get_events        -> lead monitors while doing other work
-get_result
-reply_to_worker   -> answers waiting_for_lead
-follow_up         -> same persistent sidekick session
-cancel
+git diff --check <base>
+protectedPaths check
++ each verificationCommands entry supplied in the brief
 ```
 
-A typical flow:
+A task only enters `completed` when these checks pass.
+
+If they fail:
 
 ```text
-Lead: delegate(task A)
-  <- taskId immediately
-
-Lead: continues planning task B
-
-Sidekick A: explores + implements + runs native subagents
-Sidekick A: needs an architectural choice
-  -> lead_question event
-
-Lead: reply_to_worker(task A, "use option B because ...")
-Sidekick A: resumes same context and completes
-
-Lead: reviews result
+running
+  -> verifying
+  -> verification_failed
+       |
+       | Lead reviews receipts
+       v
+    follow_up
+       |
+       v
+    same Sidekick session/worktree
+       |
+       v
+    verifying again
 ```
 
-## Native subagents
+Verification commands are explicit commands supplied in the delegation brief. orchestration does not currently guess a project's test command.
 
-orchestration preserves each runtime's own agent hierarchy rather than emulating it.
+## Worktree lifecycle
 
-- OpenCode: native subagents; nesting depends on runtime permissions/configuration.
-- Antigravity: parallel native subagents.
-- Command Code: parallel native subagents, one level deep.
+Worktrees default under the operating system temp directory:
 
-Use `subagentPolicy: "auto" | "prefer" | "avoid"` on `delegate` as a delegation hint.
+```text
+<tmp>/orchestration/worktrees/<repo>-<hash>/<task-id>
+```
 
-## Design principles
+Override with:
 
-- **Native runtimes, not a model proxy.**
-- **Persistent workers.**
-- **Frontier intelligence owns judgment.**
-- **Sidekicks ask instead of guessing.**
-- **Typed briefs, not whole transcripts.**
-- **Native subagents remain native.**
-- **Verify independently.** Tests, lint, and diffs are evidence; a worker's self-report is not.
-- **Credentials stay native.**
+```bash
+ORCHESTRATION_WORKTREE_ROOT=/path/to/worktrees
+```
 
-## Important concurrency note
+Completed/failed/cancelled worktrees are preserved for review. Call `cleanup` when the Lead no longer needs them.
 
-Lead and sidekick can now run concurrently, but worktree isolation is not implemented yet. Until it is, avoid having the lead and sidekick write the same delegated files at the same time.
+## Supported runtimes
 
-The next safety-critical milestone is isolated git worktrees plus harness-owned verification.
+| Runtime | Persistent session | Parallel subagents | Nesting |
+| --- | ---: | ---: | --- |
+| OpenCode | yes | yes | runtime/config-defined |
+| Antigravity / `agy` | yes | yes | runtime-defined |
+| Command Code | yes | yes | one level |
+
+## Provider credentials
+
+The provider registry detects, but does not persist:
+
+- `GEMINI_API_KEY`
+- `OPENAI_API_KEY`
+- `OPENROUTER_API_KEY`
+
+Authentication remains owned by the native runtime/provider.
 
 ## Development
 
@@ -123,13 +148,16 @@ npm run build
 npm run typecheck
 ```
 
-Copy `.env.example` and configure whichever native runtimes you want.
-
 ## Status
 
-Current focus: Fusion-style lead/sidekick coordination and persistent native runtime sessions.
+The current safety boundary is now:
 
-Next: worktree isolation, verifier receipts, SQLite persistence, and richer streaming/subagent telemetry.
+```text
+Lead workspace != Sidekick workspace
+Sidekick claim != verification result
+```
+
+Still planned: durable SQLite task state, native streaming/subagent telemetry, merge/apply workflow, and routing/escalation policy.
 
 ## License
 

@@ -4,47 +4,108 @@
 
 orchestration is a local coordination layer between a frontier lead and one or more native coding-agent sidekicks.
 
-The target interaction model is intentionally close to the useful part of Cognition's Fusion architecture:
+The current architecture implements the core Lead/Sidekick shape:
 
-- the lead owns planning, ambiguity, architectural judgment, and final review
-- a sidekick owns bounded execution
-- both keep independent persistent contexts
-- they exchange briefs, results, feedback, and explicit judgment questions rather than mirroring whole transcripts
-- lead and sidekick run concurrently
-- a sidekick may use its native runtime's subagents
+- Lead owns planning, ambiguity, architectural judgment, and final review.
+- Sidekick owns bounded execution.
+- Both keep independent persistent contexts.
+- Lead and Sidekick run concurrently.
+- Sidekick can ask the Lead instead of guessing through a material judgment call.
+- Sidekick can use runtime-native subagents.
+- Sidekick writes are isolated in per-task git worktrees.
+- Completion is checked by a verifier owned by the orchestration harness.
 
-Dynamic model switching at compaction boundaries is intentionally **out of scope for now**.
+Dynamic model switching at context compaction boundaries remains intentionally out of scope.
 
-## Hierarchy
+## Execution topology
 
 ```text
-User
-  |
-  v
-Lead (frontier model)
-  | \
-  |  \ keeps planning / monitoring / reviewing
-  |   \
-  |    +--------------------------+
-  |                               |
-  | delegate (async)              |
-  v                               |
-Sidekick (persistent context)     |
-  |                               |
-  +--> native subagent(s)         |
-  |       exploration/tests/etc.  |
-  |                               |
-  +--> lead question -------------+
-        when judgment is needed
+                         Lead
+                plan / judgment / review
+                 /                  \
+        delegate task A        delegate task B
+              |                     |
+              v                     v
+      Worktree A @ base X     Worktree B @ base X
+          Sidekick A              Sidekick B
+           /     \                   |
+      subagent subagent           subagent
+              |
+        lead question
+              |
+              +--------------------> Lead
 ```
 
-The lead can delegate several independent sidekick tasks. A sidekick can fan out to native subagents when its runtime supports that capability.
+The original repository is not the sidekick's working directory.
+
+## Worktree isolation
+
+For each delegated task:
+
+1. Resolve the source git repository.
+2. Require a clean source worktree.
+3. Capture the current `HEAD` as `baseCommit`.
+4. Create a detached git worktree outside the source repository.
+5. Preserve the caller's relative subdirectory inside that worktree.
+6. Start the native sidekick with the isolated path as its `cwd`.
+
+This means a Lead can continue changing the original worktree without racing the Sidekick's filesystem writes.
+
+The tradeoff is deliberate: uncommitted changes that existed before delegation are not copied. Rather than silently lose that context, delegation fails until the source tree is clean.
+
+### Why detached worktrees
+
+Sidekicks do not need branch ownership yet. The base commit is stored explicitly and every review/verification diff is computed against that immutable base. This remains correct even if a native agent creates commits inside its detached worktree.
+
+A later merge/apply layer can decide how approved work returns to the Lead branch.
+
+## Verification
+
+A Sidekick's "done" message is evidence of intent, not evidence of correctness.
+
+After every successful Sidekick turn, orchestration enters `verifying` and runs:
+
+1. `git diff --check <baseCommit>`
+2. protected-path validation over all tracked and untracked changed paths
+3. each explicit `verificationCommands` entry from the Lead's task brief
+
+Each command produces a receipt:
+
+```ts
+interface VerificationReceipt {
+  name: string
+  command: string
+  exitCode: number
+  passed: boolean
+  durationMs: number
+  stdoutTail?: string
+  stderrTail?: string
+}
+```
+
+The aggregate report includes changed files, untracked files, diff stat, protected-path violations, and the command receipts.
+
+If any check fails, task state becomes `verification_failed` rather than `completed`. The Lead can inspect the receipts and call `follow_up`; the same native Sidekick session and worktree are reused, then verification runs again.
+
+## State model
+
+```text
+queued
+  -> preparing_workspace
+  -> running
+       -> waiting_for_lead
+            -> running
+       -> verifying
+            -> completed
+            -> verification_failed
+                 -> running
+       -> failed
+       -> cancelled
+```
 
 ## Lead-question protocol
 
-A sidekick must not silently guess through a material judgment call.
-
-When it needs the lead, it ends its current turn with:
+When a Sidekick needs a material judgment from the Lead, it ends its turn with:
 
 ```text
 <orchestration_lead_query>
@@ -52,37 +113,35 @@ When it needs the lead, it ends its current turn with:
 </orchestration_lead_query>
 ```
 
-orchestration detects that envelope and moves the task to `waiting_for_lead`.
+The harness detects that envelope and moves the task to `waiting_for_lead`.
 
-The lead sees a `lead_question` event through `get_events` / `get_result`, calls `reply_to_worker`, and orchestration resumes the **same native sidekick session**.
+`reply_to_worker` resumes the same native session with the Lead's answer.
 
-This is a cooperative checkpoint rather than a model-to-model API call: orchestration never needs the lead model's API key.
+## Diff review
 
-## Concurrency model
+`get_diff` reads the isolated worktree against its captured base commit.
 
-`delegate` is non-blocking from the lead's perspective:
+It returns:
 
-```text
-delegate
-  -> allocate orchestration task id
-  -> start native worker in background
-  -> return immediately
+- changed files
+- untracked files
+- diff stat
+- bounded patch text
+- whether patch text was truncated
 
-lead
-  -> continues planning / another task / monitoring
+The Lead can request up to 200k patch characters. Large or binary/untracked artifacts should be inspected directly in the returned worktree path.
 
-sidekick
-  -> works independently
-  -> completes, fails, or asks lead
-```
+## Native subagents
 
-The MCP surface exposes `get_events` so the lead can observe sidekick state without occupying the original delegation call.
+orchestration preserves rather than reimplements native hierarchies:
 
-Until worktree isolation lands, concurrent **writes** to the same files are unsafe. The lead should keep doing judgment/review work and avoid editing the delegated scope while that sidekick is active.
+- OpenCode: subagents and Task permissions; nesting is configuration/runtime-defined.
+- Antigravity: parallel native subagents; exact nesting is runtime-defined.
+- Command Code: parallel subagents, one level deep.
+
+All child agents work inside the Sidekick's isolated worktree because the native runtime is launched there.
 
 ## Runtime vs provider
-
-These remain separate concepts.
 
 ```text
 Runtime
@@ -96,65 +155,34 @@ Provider credential
   OpenRouter API key
 ```
 
-A runtime owns the coding-agent loop, tools, subagents, and native session. A provider credential only gives a compatible runtime access to a model.
-
-orchestration does not store provider secrets.
-
-## Sidekick -> subagent capabilities
-
-Capabilities are exposed to the lead through `list_workers`.
-
-- **OpenCode:** native subagents supported; nesting is runtime/configuration-defined. OpenCode's Task permissions determine whether a spawned agent may itself invoke another agent.
-- **Antigravity:** parallel native subagents supported. The runtime controls the exact hierarchy.
-- **Command Code:** parallel native subagents supported, but delegation is one level deep; subagents do not receive the agent-spawning tools.
-
-orchestration does not reimplement these agent systems. It preserves them.
-
-## Core invariants
-
-1. **Frontier lead remains authoritative.**
-2. **Native session continuity.**
-3. **No whole-transcript mirroring by default.**
-4. **Sidekicks may ask instead of guessing.**
-5. **Lead and sidekick are concurrent, but writes must be isolated before true concurrent editing is safe.**
-6. **Sidekick subagents use the native runtime's semantics and limits.**
-7. **Worker self-reports are not proof.** Harness-owned verification receipts are still planned.
-8. **Provider secrets are not orchestration state.**
-9. **No dynamic compaction-time model switching yet.**
+Runtime owns the coding-agent loop, tools, subagents, and native session. Provider credentials remain outside orchestration state.
 
 ## MCP surface
 
-- `list_workers` — runtime capabilities
-- `delegate` — asynchronously start a sidekick
-- `get_result` — inspect current task state
-- `get_events` — inspect incremental task events
-- `reply_to_worker` — answer a sidekick judgment question
-- `follow_up` — resume a completed persistent sidekick with feedback
-- `cancel` — cancel a task
+- `list_workers`
+- `delegate`
+- `get_events`
+- `get_result`
+- `get_diff`
+- `reply_to_worker`
+- `follow_up`
+- `cancel`
+- `cleanup`
 
-## State model
+## Remaining boundary
 
-```text
-queued
-  -> running
-       -> waiting_for_lead
-            -> running
-       -> completed
-       -> failed
-       -> cancelled
-```
+Worktree isolation solves concurrent writes, but **approved-change integration is not implemented yet**.
 
-The current task registry remains in memory. SQLite persistence is still planned.
+There is intentionally no automatic `apply` or `merge` tool today. The Lead should review the isolated diff first. A later apply layer should use the stored `baseCommit` to detect divergence/conflicts before touching the Lead worktree.
 
 ## Planned layers
 
-1. git worktree isolation
-2. verifier-owned test/lint/diff receipts
-3. SQLite task/session persistence
-4. native streaming/subagent telemetry
-5. runtime/provider doctor command
-6. rule-based routing and escalation
-7. execution telemetry and lead-rework metrics
-8. adaptive routing based on observed outcomes
+1. durable SQLite task/session/worktree registry
+2. native streaming and subagent telemetry
+3. guarded apply/merge workflow with conflict detection
+4. runtime/provider doctor command
+5. rule-based routing and automatic escalation
+6. execution telemetry and Lead-rework metrics
+7. adaptive routing based on observed outcomes
 
-Compaction-time model switching is deliberately deferred.
+Compaction-time model switching remains deferred.
