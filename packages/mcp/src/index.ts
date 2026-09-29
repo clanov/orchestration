@@ -457,7 +457,7 @@ export function createOrchestrationServer(
       invalidateApplyPlan(record);
       record.state = "running";
       record.updatedAt = now();
-      emit(record, "follow_up", "Lead sent the next handoff to the persistent Sidekick.");
+      emit(record, "handoff", "Lead sent the next handoff to the persistent Sidekick.");
 
       void continueTask(record, message);
 
