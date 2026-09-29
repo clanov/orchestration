@@ -82,14 +82,16 @@ function createUnifiedSidekick(runtime: SidekickRuntime): WorkerAdapter {
       });
     }
 
-    case "antigravity":
+    case "antigravity": {
+      const agyEffort = parseAgyEffort(effort);
       return new AntigravityWorker({
         ...(command ? { command } : {}),
         model,
-        ...(parseAgyEffort(effort) ? { effort: parseAgyEffort(effort) } : {}),
+        ...(agyEffort ? { effort: agyEffort } : {}),
         allowMutations,
         timeoutMs,
       });
+    }
 
     case "command-code":
       return new CommandCodeWorker({
